@@ -22,6 +22,7 @@ param(
     [string]$CancelFile
 )
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'bitrix24_http.ps1')
 if (-not $SelfTest -and -not $Resume -and -not $RebuildOnly -and $EmployeeId -lt 1) {throw 'Сотрудник не выбран. Выберите его в интерфейсе или укажите -EmployeeId при консольном запуске.'}
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 $Invariant = [Globalization.CultureInfo]::InvariantCulture
@@ -37,6 +38,8 @@ $script:LastRef = ''
 $script:NetworkCalls = 0
 $script:CachedCalls = 0
 $script:IncompleteRun = $true
+$script:AppVersion='1.1.0'
+$script:EventUserOnlyDone=$false
 
 function Value($Object, [string]$Name) {
     if ($null -eq $Object) { return $null }
@@ -198,15 +201,17 @@ function Invoke-Api([string]$Method, $Payload, [int]$Version=2) {
     $url = "$base/$Method"
     for ($attempt=1; $attempt -le $MaxAttempts; $attempt++) {
         Assert-Collecting
-        $http = 0; $retryAfter = ''; $data = $null; $errorCode = ''; $description = ''
+        $http = 0; $retryAfter = ''; $data = $null; $errorCode = ''; $description = ''; $responseText='' 
         try {
             if ($PauseMilliseconds -gt 0) { Start-Sleep -Milliseconds $PauseMilliseconds }
             Write-Progress -Activity $script:CurrentSource -Status "$Method — попытка $attempt/$MaxAttempts; сохранённых страниц: $script:CachedCalls"
             $script:NetworkCalls++
             # Bytes keep UTF-8 behavior identical in Windows PowerShell 5.1 and PowerShell 7.
-            $webResponse = Invoke-WebRequest -UseBasicParsing -Method Post -Uri $url -ContentType 'application/json; charset=utf-8' -Body ([Text.Encoding]::UTF8.GetBytes($body)) -TimeoutSec 90 -MaximumRedirection 0 -ErrorAction Stop
-            $data = Read-Json $webResponse.Content
-            $http = 200
+            $webResponse = Invoke-AuditHttp -UseBasicParsing -Method Post -Uri $url -ContentType 'application/json; charset=utf-8' -Body ([Text.Encoding]::UTF8.GetBytes($body)) -TimeoutSec 90 -MaximumRedirection 0 -ErrorAction Stop
+            $responseText=[string]$webResponse.Content
+            $http=if ($webResponse.StatusCode) {[int]$webResponse.StatusCode} else {200}
+            $retryAfter=[string]$webResponse.RetryAfter
+            try {$data=Read-Json $responseText} catch {$description='Ответ сервера не является JSON: '+(Protect-Text $responseText)}
         } catch {
             $response = $_.Exception.Response
             if ($null -ne $response) {
@@ -223,7 +228,7 @@ function Invoke-Api([string]$Method, $Payload, [int]$Version=2) {
         $errorValue = Value $data 'error'
         if ($errorValue) {
             if ($errorValue -is [string]) { $errorCode = $errorValue; $description = [string](Value $data 'error_description') }
-            else { $errorCode = [string](Value $errorValue 'code'); $description = [string](Value $errorValue 'message') }
+            else { $errorCode = [string](Value $errorValue 'code'); $description = [string](Value $errorValue 'message');if(Has $errorValue 'validation'){$description+='; validation='+(Json $errorValue.validation)} }
         }
         if ($http -eq 200 -and -not $errorValue -and $null -ne $data) {
             Validate-Response $Method $data
@@ -234,9 +239,10 @@ function Invoke-Api([string]$Method, $Payload, [int]$Version=2) {
             return $data
         }
         $failureRef="raw/failed-$Method-$cacheKey-$attempt.json"
-        Save-Json (Join-Path $OutputDir $failureRef) ([ordered]@{Request=@{Method=$Method;Version=$Version;Body=$body};HTTP=$http;Error=$errorCode;Description=(Protect-Text $description);Response=(Protect-Text (Json $data));FetchedAt=[DateTimeOffset]::UtcNow.ToString('o')})
+        Save-Json (Join-Path $OutputDir $failureRef) ([ordered]@{Request=@{Method=$Method;Version=$Version;Body=$body};HTTP=$http;Error=$errorCode;Description=(Protect-Text $description);Response=(Protect-Text $responseText);ParsedResponse=(Protect-Text (Json $data));FetchedAt=[DateTimeOffset]::UtcNow.ToString('o')})
+        if (-not $description -and $http -ne 200) {$description=if($responseText){Protect-Text $responseText}else{'Сервер вернул пустое тело ответа'}}
         $message = "$Method HTTP=$http API=$errorCode $(Protect-Text $description); ответ: $failureRef"
-        if ($http -in @(401,404) -or $errorCode -match '(?i)(INSUFFICIENT_SCOPE|METHOD_NOT_FOUND|INVALID_CREDENTIALS|NO_AUTH_FOUND)') {
+        if (($Version -eq 3 -and $http -in @(400,403)) -or $http -in @(401,404) -or $errorCode -match '(?i)(INSUFFICIENT_SCOPE|METHOD_NOT_FOUND|INVALID_CREDENTIALS|NO_AUTH_FOUND)') {
             $script:Disabled[$Method] = $message
             throw $message
         }
@@ -321,9 +327,11 @@ $TaskActions=@{
  ADD_IN_REPORT='Изменил включение в отчёт'; TASK_CONTROL='Изменил контроль результата'; ALLOW_TIME_TRACKING='Изменил учёт времени'
  ALLOW_CHANGE_DEADLINE='Изменил разрешение менять срок'; FLOW_ID='Изменил поток'; MOVE_TO_BACKLOG='Перенёс в бэклог'; MOVE_TO_SPRINT='Перенёс в спринт'
 }
-function Read-EventWindow([DateTimeOffset]$Left,[DateTimeOffset]$Right) {
+function Read-EventWindow([DateTimeOffset]$Left,[DateTimeOffset]$Right,[switch]$UserOnly) {
     try {
-        $filter=@(@('userId','=',$EmployeeId),@('timestampX','>=',$Left.ToString('o')),@('timestampX','<',$Right.ToString('o')))
+        $filter=@(@('userId','=',$EmployeeId),@('timestampX','>=',$Left.ToString('yyyy-MM-ddTHH:mm:sszzz')),@('timestampX','<',$Right.ToString('yyyy-MM-ddTHH:mm:sszzz')))
+        if ($Right.Ticks % [TimeSpan]::TicksPerSecond -ne 0) {$filter[2][2]=$Right.AddSeconds(1).ToString('yyyy-MM-ddTHH:mm:sszzz')}
+        if ($UserOnly) {$filter=@(,@('userId','=',$EmployeeId))}
         Get-Pages 'main.eventlog.list' ([ordered]@{select=@('id','timestampX','severity','auditTypeId','moduleId','itemId','remoteAddr','userAgent','requestUri','userId','description');filter=$filter;order=@{id='ASC'}}) 'items' 'V3' | ForEach-Object {
             $script:LastRef=$_.Raw
             foreach ($item in $_.Items) {
@@ -335,10 +343,19 @@ function Read-EventWindow([DateTimeOffset]$Left,[DateTimeOffset]$Right) {
             }
         }
     } catch {
+        if (-not $UserOnly -and $_.Exception.Message -match 'HTTP=400\b') {
+            # Portal versions can reject date filters; collect this user's available log and filter dates locally.
+            $script:Disabled.Remove('main.eventlog.list')
+            Write-Host 'Event Log: сервер отклонил фильтр периода; пробуем фильтр только по сотруднику и локальный отбор дат.'
+            $script:EventUserOnlyDone=$true
+            Read-EventWindow $script:Begin $script:End -UserOnly
+            return
+        }
+        if ($_.Exception.Message -match 'HTTP=(400|401|403|404)\b') {throw}
         # Split only timeout/temporary-server errors; permission and validation errors cannot be fixed by a smaller window.
         if ($_.Exception.Message -match 'HTTP=(0|500|502|503|504)\b' -and ($Right-$Left).TotalHours -gt 1) {
             $middle=$Left.AddTicks([long](($Right-$Left).Ticks/2)); Read-EventWindow $Left $middle; Read-EventWindow $middle $Right
-        } else { Note-Error "$($Left.ToString('o')) .. $($Right.ToString('o'))" $_.Exception.Message }
+        } else { Note-Error "$($Left.ToString('yyyy-MM-ddTHH:mm:sszzz')) .. $($Right.ToString('yyyy-MM-ddTHH:mm:sszzz'))" $_.Exception.Message }
     }
 }
 function Collect-Tasks([string]$Kind) {
@@ -509,7 +526,7 @@ function Collect-Timecontrol {
     }
 }
 function Collect-Calls {
-    Get-Pages 'voximplant.statistic.get' ([ordered]@{FILTER=@{PORTAL_USER_ID=$EmployeeId;'>=CALL_START_DATE'=$script:Begin.ToString('o');'<CALL_START_DATE'=$script:End.ToString('o')};SORT='ID';ORDER='ASC'}) | ForEach-Object {
+    Get-Pages 'voximplant.statistic.get' ([ordered]@{FILTER=@{PORTAL_USER_ID=$EmployeeId;'>=CALL_START_DATE'=$script:Begin.ToString('yyyy-MM-ddTHH:mm:sszzz');'<CALL_START_DATE'=$script:End.ToString('yyyy-MM-ddTHH:mm:sszzz')};SORT='ID';ORDER='ASC'}) | ForEach-Object {
         $script:LastRef=$_.Raw
         foreach ($call in $_.Items) {
             if ([string]$call.PORTAL_USER_ID -ne [string]$EmployeeId) { continue }
@@ -563,7 +580,7 @@ function Export-Report {
         if ($script:Status[$name].Status -eq 'running') { $script:Status[$name].Status='interrupted' }
     }
     Save-Json (Join-Path $OutputDir 'status.json') $script:Status
-    $summary=[ordered]@{EmployeeId=$EmployeeId;From=$script:Begin.ToString('o');ToExclusive=$script:End.ToString('o');TimeZone=$TimeZoneId;InputTimeZone=$InputTimeZoneId;Rows=$sorted.Count;Errors=$script:Errors.Count;Rejected=$script:Rejected.Count;NetworkCalls=$script:NetworkCalls;CachedCalls=$script:CachedCalls;Interrupted=$script:IncompleteRun;FullPortalHistoryConfirmed=$false;Sources=$script:Status;Gaps=@(
+    $summary=[ordered]@{AppVersion=$script:AppVersion;EventLogLocalDateFilter=$script:EventUserOnlyDone;EmployeeId=$EmployeeId;From=$script:Begin.ToString('o');ToExclusive=$script:End.ToString('o');TimeZone=$TimeZoneId;InputTimeZone=$InputTimeZoneId;Rows=$sorted.Count;Errors=$script:Errors.Count;Rejected=$script:Rejected.Count;NetworkCalls=$script:NetworkCalls;CachedCalls=$script:CachedCalls;Interrupted=$script:IncompleteRun;FullPortalHistoryConfirmed=$false;Sources=$script:Status;Gaps=@(
         'Доступ и сроки хранения ограничивают любой источник. completed_with_limits означает завершение обхода доступных объектов, а не полную историю портала.'
         'Удалённые/скрытые задачи и элементы CRM могут не попасть в перечисление, даже у администратора. Скрипт не обходит права доступа.'
         'Старые комментарии доступны только через существующие родительские элементы. Метаданные не содержат промежуточных изменений.'
@@ -613,7 +630,7 @@ function Test-Normalization {
     $script:Rows.Clear();$script:Seen=@{};$script:Errors.Clear();$script:Rejected.Clear()
 }
 function Install-TestTransport {
-    function script:Invoke-WebRequest {
+    function script:Invoke-AuditHttp {
         param([switch]$UseBasicParsing,$Method,$Uri,$ContentType,$Body,$TimeoutSec,$MaximumRedirection,$ErrorAction)
         [pscustomobject]@{Content=(Json (Get-TestResponse -Method $Method -Uri $Uri -ContentType $ContentType -Body $Body -TimeoutSec $TimeoutSec -MaximumRedirection $MaximumRedirection -ErrorAction $ErrorAction))}
     }
@@ -751,7 +768,7 @@ try {
         }
         Run-Source 'Event Log' 'События, сохранённые журналом за период; зависит от тарифа и срока хранения' {
             $left=$script:Begin
-            while ($left -lt $script:End) { $right=$left.AddHours($EventWindowHours);if ($right -gt $script:End) {$right=$script:End};Read-EventWindow $left $right;$left=$right }
+            while ($left -lt $script:End) { $right=$left.AddHours($EventWindowHours);if ($right -gt $script:End) {$right=$script:End};Read-EventWindow $left $right;if($script:EventUserOnlyDone){break};$left=$right }
         }
         Run-Source 'История задач' 'Все перечисленные доступные задачи; фильтрация по user.id автора изменения' { Collect-Tasks 'history' }
         Run-Source 'Трудозатраты' 'Записи от имени сотрудника; даты ручного учёта могут отличаться от времени внесения' { Collect-Tasks 'elapsed' }

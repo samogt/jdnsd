@@ -2,6 +2,7 @@
 [CmdletBinding()]
 param([switch]$SelfTest,[string]$EmployeeListFile,[string]$CancelFile)
 $ErrorActionPreference='Stop'
+. (Join-Path $PSScriptRoot 'bitrix24_http.ps1')
 $script:AppRoot=$PSScriptRoot
 
 function Hide-AuditSecret([string]$Text) {
@@ -60,8 +61,9 @@ function Get-PortalEmployees([string]$Webhook,[string]$Destination,[string]$Stop
             $http=0;$code='';$description=''
             $body=@{select=@('ID','NAME','LAST_NAME','SECOND_NAME','ACTIVE');filter=@{USER_TYPE='employee'};ADMIN_MODE=$true;sort='ID';order='ASC';start=$position}|ConvertTo-Json -Compress
             try {
-                $response=Invoke-WebRequest -UseBasicParsing -Method Post -Uri ($hook.BaseUrl+'/user.get') -ContentType 'application/json; charset=utf-8' -Body ([Text.Encoding]::UTF8.GetBytes($body)) -TimeoutSec 90 -MaximumRedirection 0 -ErrorAction Stop
-                $data=$response.Content|ConvertFrom-Json;$http=200
+                $response=Invoke-AuditHttp -UseBasicParsing -Method Post -Uri ($hook.BaseUrl+'/user.get') -ContentType 'application/json; charset=utf-8' -Body ([Text.Encoding]::UTF8.GetBytes($body)) -TimeoutSec 90 -MaximumRedirection 0 -ErrorAction Stop
+                $http=if($response.StatusCode){[int]$response.StatusCode}else{200}
+                try {$data=$response.Content|ConvertFrom-Json} catch {$description='Сервер вернул не JSON: '+(Hide-AuditSecret $response.Content)}
             } catch {
                 if ($_.Exception.Response) {try {$http=[int]$_.Exception.Response.StatusCode} catch {}}
                 if ($_.ErrorDetails.Message) {try {$data=$_.ErrorDetails.Message|ConvertFrom-Json} catch {}}
@@ -237,7 +239,7 @@ function Test-GuiCore {
     $copy=$v.Clone();$copy.EmployeeId='';$rejected=$false;try {$null=New-AuditJob $copy} catch {$rejected=$true}
     if (-not $rejected) {throw 'GUI SELFTEST: неявный сотрудник по умолчанию'}
     $script:UserPageCalls=0
-    function Invoke-WebRequest {
+    function Invoke-AuditHttp {
         param([switch]$UseBasicParsing,$Method,$Uri,$ContentType,$Body,$TimeoutSec,$MaximumRedirection,$ErrorAction)
         $script:UserPageCalls++
         $b=[Text.Encoding]::UTF8.GetString($Body)|ConvertFrom-Json
@@ -263,7 +265,7 @@ Add-Type -AssemblyName PresentationFramework,PresentationCore,WindowsBase,System
 if ([Threading.Thread]::CurrentThread.ApartmentState -ne 'STA') { throw 'Запустите START_GUI.cmd или PowerShell с параметром -STA.' }
 try {
 [xml]$xaml=@'
-<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" Title="Битрикс24 • Отчёт по сотруднику" Width="1140" Height="880" MinWidth="940" MinHeight="660" WindowStartupLocation="CenterScreen" Background="#F3F5F8" FontFamily="Segoe UI" FontSize="14" Language="ru-RU">
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" Title="Битрикс24 • Отчёт по сотруднику • 1.1.0" Width="1140" Height="880" MinWidth="940" MinHeight="660" WindowStartupLocation="CenterScreen" Background="#F3F5F8" FontFamily="Segoe UI" FontSize="14" Language="ru-RU">
  <Window.Resources>
   <SolidColorBrush x:Key="Muted" Color="#596779"/>
   <Style TargetType="TextBox"><Setter Property="Padding" Value="10,7"/><Setter Property="BorderBrush" Value="#CAD3DF"/><Setter Property="VerticalContentAlignment" Value="Center"/><Setter Property="Background" Value="White"/></Style>
@@ -506,6 +508,8 @@ function Finish-Run {
         $Ui.State.Text='Сбор остановлен';$Ui.StateHelp.Text='Частичный отчёт сохранён. Выберите режим продолжения и эту папку выгрузки.'
     } elseif ($code -ne 0 -or -not $summary) {
         $Ui.State.Text='Не удалось завершить сбор';$Ui.StateHelp.Text='Разверните журнал выполнения ниже. Успешно полученные страницы можно использовать при продолжении.'
+    } elseif ([int]$summary.Rows -eq 0 -and [int]$summary.Errors -gt 0) {
+        $Ui.State.Text='События не получены: ошибки источников';$Ui.StateHelp.Text='Раскройте журнал: в новой версии показан ответ сервера и код API. Проверьте эти сообщения перед повторным сбором.'
     } elseif ([int]$summary.Errors -gt 0) {
         $Ui.State.Text='Отчёт готов, есть пробелы';$Ui.StateHelp.Text='Откройте таблицу: в ней указаны недоступные источники и ошибки сбора.'
     } else {
