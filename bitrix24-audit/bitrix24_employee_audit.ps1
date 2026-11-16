@@ -12,7 +12,7 @@ param(
     [string]$OutputDir,
     [string]$TimeZoneId = 'Russian Standard Time',
     [string]$InputTimeZoneId = 'Russian Standard Time',
-    [ValidateRange(0,60000)][int]$PauseMilliseconds = 550,
+    [ValidateRange(0,60000)][int]$PauseMilliseconds = 1000,
     [ValidateRange(1,8)][int]$MaxAttempts = 4,
     [ValidateRange(1,24)][int]$EventWindowHours = 24,
     [ValidateRange(1,24)][int]$WorkdayHours = 8,
@@ -38,8 +38,11 @@ $script:LastRef = ''
 $script:NetworkCalls = 0
 $script:CachedCalls = 0
 $script:IncompleteRun = $true
-$script:AppVersion='1.1.0'
+$script:AppVersion='1.2.0'
 $script:EventUserOnlyDone=$false
+$script:RateBlocked=@{}
+$script:Deferred=New-Object Collections.Generic.List[object]
+$script:RetryingDeferred=$false
 
 function Value($Object, [string]$Name) {
     if ($null -eq $Object) { return $null }
@@ -121,7 +124,37 @@ function Assert-Collecting {
         throw [OperationCanceledException]::new('AUDIT_CANCELLED: остановка по запросу пользователя')
     }
 }
-function Note-Error([string]$Unit, [string]$Message) {
+function Is-RateLimit([string]$Message) {return $Message -match '(HTTP=429|RATELIMITEXCEPTION|OPERATION_TIME_LIMIT)'}
+function Get-RetrySeconds([string]$Header,[double]$Default) {
+    $n=0.0
+    if ([double]::TryParse($Header,[Globalization.NumberStyles]::Float,$Invariant,[ref]$n) -and $n -ge 0) {return [Math]::Max($Default,$n)}
+    $date=[DateTimeOffset]::MinValue
+    if ($Header -and [DateTimeOffset]::TryParse($Header,[ref]$date)) {return [Math]::Max($Default,($date-[DateTimeOffset]::UtcNow).TotalSeconds)}
+    return $Default
+}
+function Wait-Api([double]$Seconds,[string]$Reason) {
+    $remaining=[int][Math]::Ceiling($Seconds)
+    while ($remaining -gt 0) {
+        Assert-Collecting
+        if ($remaining % 5 -eq 0 -or $remaining -eq [int][Math]::Ceiling($Seconds)) {Write-Host "[Ожидание API] $Reason. Осталось $remaining сек. Остановка доступна."}
+        Start-Sleep -Seconds 1;$remaining--
+    }
+    Assert-Collecting
+}
+function Retry-Deferred {
+    $script:RetryingDeferred=$true
+    $budget=[Diagnostics.Stopwatch]::StartNew()
+    foreach ($entry in @($script:Deferred.ToArray())) {
+        Assert-Collecting
+        $wait=0.0
+        foreach ($until in $script:RateBlocked.Values) {$wait=[Math]::Max($wait,([DateTimeOffset]$until-[DateTimeOffset]::UtcNow).TotalSeconds)}
+        if ($wait -gt 0 -and $wait -gt [Math]::Max(0,(300-$budget.Elapsed.TotalSeconds))) {Write-Host '[API] Повтор отложенных источников требует более долгой паузы. Сохраняем частичный отчёт; позднее выберите продолжение.';break}
+        Wait-Api $wait "Снимается ограничение перед повтором источника $($entry.Name)"
+        Run-Source $entry.Name $entry.Limit $entry.Body
+    }
+}
+function Note-Error([string]$Unit, [string]$Message,[switch]$SourceBoundary) {
+    if (-not $SourceBoundary -and (Is-RateLimit $Message)) {throw $Message}
     Assert-Collecting
     $entry = [pscustomobject]@{ Source=$script:CurrentSource; Unit=$Unit; Message=(Protect-Text $Message); At=[DateTimeOffset]::UtcNow.ToString('o') }
     $script:Errors.Add($entry)
@@ -197,6 +230,7 @@ function Invoke-Api([string]$Method, $Payload, [int]$Version=2) {
         return $saved.Response
     }
     if ($RebuildOnly) { throw "Нет сохранённой страницы $relative; RebuildOnly запрещает сеть" }
+    if ($script:RateBlocked.ContainsKey($Method) -and [DateTimeOffset]$script:RateBlocked[$Method] -gt [DateTimeOffset]::UtcNow) {throw "$Method HTTP=429 METHOD_DEFERRED: до $($script:RateBlocked[$Method])"}
     $base = if ($Version -eq 3) { $script:Rest3 } else { $script:Rest2 }
     $url = "$base/$Method"
     for ($attempt=1; $attempt -le $MaxAttempts; $attempt++) {
@@ -246,17 +280,20 @@ function Invoke-Api([string]$Method, $Payload, [int]$Version=2) {
             $script:Disabled[$Method] = $message
             throw $message
         }
+        if ($http -eq 429 -or (Is-RateLimit $errorCode)) {
+            $seconds=Get-RetrySeconds $retryAfter 300
+            $script:RateBlocked[$Method]=[DateTimeOffset]::UtcNow.AddSeconds($seconds).ToString('o')
+            Save-Json (Join-Path $OutputDir 'rate_limits.json') $script:RateBlocked
+            $script:PauseMilliseconds=[Math]::Max(1000,$script:PauseMilliseconds)
+            Write-Host "[API] $Method ограничен до $($script:RateBlocked[$Method]). Переходим к другим источникам."
+            throw $message
+        }
+        if ($errorCode -match 'LIMITER_QUERYTIMELIMITEXCEPTION') {throw $message}
         $retry = ($http -eq 0 -or $http -eq 429 -or $http -in @(500,502,503,504) -or $errorCode -match '(?i)(QUERY_LIMIT_EXCEEDED|TOO_MANY_REQUESTS|OVERLOAD)')
         if (-not $retry -or $attempt -eq $MaxAttempts) { throw $message }
-        $seconds = [Math]::Min(30, [Math]::Pow(2,$attempt))
-        $retryNumber = 0
-        if ([int]::TryParse($retryAfter, [ref]$retryNumber)) { $seconds = [Math]::Max($seconds,$retryNumber) }
-        elseif ($retryAfter) {
-            $retryDate = [DateTimeOffset]::MinValue
-            if ([DateTimeOffset]::TryParse($retryAfter,[ref]$retryDate)) { $seconds = [Math]::Max($seconds,($retryDate-[DateTimeOffset]::UtcNow).TotalSeconds) }
-        }
-        # Honor Retry-After while keeping individual waits short and interruptible.
-        while ($seconds -gt 0) { Assert-Collecting; $chunk=[Math]::Min(1,$seconds); Start-Sleep -Seconds ([int][Math]::Ceiling($chunk)); $seconds-=$chunk }
+        $defaultWait=if($errorCode -match 'QUERY_LIMIT_EXCEEDED|TOO_MANY_REQUESTS'){30*[Math]::Pow(2,$attempt-1)}else{[Math]::Min(30,[Math]::Pow(2,$attempt))}
+        Wait-Api (Get-RetrySeconds $retryAfter $defaultWait) "${Method}: повтор $($attempt+1)/$MaxAttempts"
+
     }
 }
 function Get-Pages {
@@ -306,10 +343,17 @@ function Run-Source([string]$Name,[string]$Limit,[scriptblock]$Body) {
     $script:Status[$Name]=[ordered]@{Status='running';PagesScope='Только объекты, видимые владельцу вебхука';Limit=$Limit;Errors=0;Rows=0}
     Save-Json (Join-Path $OutputDir 'status.json') $script:Status
     Write-Host "`n[$Name] $Limit" -ForegroundColor Cyan
-    try { & $Body } catch { Note-Error $Name $_.Exception.Message }
+    try { & $Body } catch {
+        Note-Error $Name $_.Exception.Message -SourceBoundary
+        if (Is-RateLimit $_.Exception.Message) {
+            $script:Status[$Name].Status='deferred'
+            if (-not $script:RetryingDeferred) {$script:Deferred.Add([pscustomobject]@{Name=$Name;Limit=$Limit;Body=$Body})}
+        }
+    }
     $s=$script:Status[$Name]
     $s.Rows=@($script:Rows | Where-Object { $_.'Источник' -eq $Name }).Count
-    if ($s.Errors -gt 0) { $s.Status=if ($s.Rows -gt 0) {'partial'} else {'failed_or_unavailable'} }
+    if ($s.Status -eq 'deferred') { }
+    elseif ($s.Errors -gt 0) { $s.Status=if ($s.Rows -gt 0) {'partial'} else {'failed_or_unavailable'} }
     else { $s.Status='completed_with_limits' }
     Save-Json (Join-Path $OutputDir 'status.json') $script:Status
 }
@@ -351,7 +395,7 @@ function Read-EventWindow([DateTimeOffset]$Left,[DateTimeOffset]$Right,[switch]$
             Read-EventWindow $script:Begin $script:End -UserOnly
             return
         }
-        if ($_.Exception.Message -match 'HTTP=(400|401|403|404)\b') {throw}
+        if ($_.Exception.Message -match 'HTTP=(400|401|403|404|429)\b') {throw}
         # Split only timeout/temporary-server errors; permission and validation errors cannot be fixed by a smaller window.
         if ($_.Exception.Message -match 'HTTP=(0|500|502|503|504)\b' -and ($Right-$Left).TotalHours -gt 1) {
             $middle=$Left.AddTicks([long](($Right-$Left).Ticks/2)); Read-EventWindow $Left $middle; Read-EventWindow $middle $Right
@@ -580,7 +624,7 @@ function Export-Report {
         if ($script:Status[$name].Status -eq 'running') { $script:Status[$name].Status='interrupted' }
     }
     Save-Json (Join-Path $OutputDir 'status.json') $script:Status
-    $summary=[ordered]@{AppVersion=$script:AppVersion;EventLogLocalDateFilter=$script:EventUserOnlyDone;EmployeeId=$EmployeeId;From=$script:Begin.ToString('o');ToExclusive=$script:End.ToString('o');TimeZone=$TimeZoneId;InputTimeZone=$InputTimeZoneId;Rows=$sorted.Count;Errors=$script:Errors.Count;Rejected=$script:Rejected.Count;NetworkCalls=$script:NetworkCalls;CachedCalls=$script:CachedCalls;Interrupted=$script:IncompleteRun;FullPortalHistoryConfirmed=$false;Sources=$script:Status;Gaps=@(
+    $summary=[ordered]@{AppVersion=$script:AppVersion;EventLogLocalDateFilter=$script:EventUserOnlyDone;EmployeeId=$EmployeeId;From=$script:Begin.ToString('o');ToExclusive=$script:End.ToString('o');TimeZone=$TimeZoneId;InputTimeZone=$InputTimeZoneId;Rows=$sorted.Count;Errors=(@($script:Status.Values | ForEach-Object {$_.Errors})|Measure-Object -Sum).Sum;ErrorHistoryCount=$script:Errors.Count;Rejected=$script:Rejected.Count;NetworkCalls=$script:NetworkCalls;CachedCalls=$script:CachedCalls;Interrupted=$script:IncompleteRun;FullPortalHistoryConfirmed=$false;Sources=$script:Status;Gaps=@(
         'Доступ и сроки хранения ограничивают любой источник. completed_with_limits означает завершение обхода доступных объектов, а не полную историю портала.'
         'Удалённые/скрытые задачи и элементы CRM могут не попасть в перечисление, даже у администратора. Скрипт не обходит права доступа.'
         'Старые комментарии доступны только через существующие родительские элементы. Метаданные не содержат промежуточных изменений.'
@@ -756,6 +800,10 @@ New-Item -ItemType Directory -Path (Join-Path $OutputDir 'raw') -Force | Out-Nul
 $lock=$null
 try {
     $lock=[IO.File]::Open((Join-Path $OutputDir '.collector.lock'),[IO.FileMode]::OpenOrCreate,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)
+    if ($Resume -and -not $RebuildOnly -and [IO.File]::Exists((Join-Path $OutputDir 'rate_limits.json'))) {
+        $limits=Read-Json ([IO.File]::ReadAllText((Join-Path $OutputDir 'rate_limits.json')))
+        foreach ($property in $limits.PSObject.Properties) {$script:RateBlocked[$property.Name]=[string]$property.Value}
+    }
     Save-Json (Join-Path $OutputDir 'manifest.json') $manifest
     Write-Host "Сотрудник: $EmployeeId; период [$($script:Begin.ToString('o')), $($script:End.ToString('o'))); зона: $TimeZoneId"
     Write-Host "Каталог: $OutputDir. Успешные страницы сохраняются сразу. Для продолжения: -Resume -OutputDir <этот каталог>"
@@ -767,6 +815,7 @@ try {
             if ($profile.result.ADMIN -ne $true -and [string]$profile.result.ADMIN -ne 'Y') { Write-Warning 'Владелец вебхука не подтверждён как администратор. Отчёт ограничен его правами.' }
         }
         Run-Source 'Event Log' 'События, сохранённые журналом за период; зависит от тарифа и срока хранения' {
+            $script:EventUserOnlyDone=$false
             $left=$script:Begin
             while ($left -lt $script:End) { $right=$left.AddHours($EventWindowHours);if ($right -gt $script:End) {$right=$script:End};Read-EventWindow $left $right;if($script:EventUserOnlyDone){break};$left=$right }
         }
@@ -779,6 +828,7 @@ try {
         Run-Source 'Рабочее время REST 3.0' 'Начало/конец доступных интервалов сотрудника; не журнал всех корректировок' { Collect-WorkRecords }
         Run-Source 'Телефония' 'История звонков, связанных с сотрудником; без скачивания записей разговоров' { Collect-Calls }
         Run-Source 'Шаблоны бизнес-процессов' 'Текущая структура шаблонов и последнее создание/изменение по USER_ID; не история роботов и прав' { Collect-Configuration }
+        Retry-Deferred
         $script:IncompleteRun=$false
     } finally { Export-Report }
     if ($SelfTest) {

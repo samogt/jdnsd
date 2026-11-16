@@ -265,7 +265,7 @@ Add-Type -AssemblyName PresentationFramework,PresentationCore,WindowsBase,System
 if ([Threading.Thread]::CurrentThread.ApartmentState -ne 'STA') { throw 'Запустите START_GUI.cmd или PowerShell с параметром -STA.' }
 try {
 [xml]$xaml=@'
-<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" Title="Битрикс24 • Отчёт по сотруднику • 1.1.0" Width="1140" Height="880" MinWidth="940" MinHeight="660" WindowStartupLocation="CenterScreen" Background="#F3F5F8" FontFamily="Segoe UI" FontSize="14" Language="ru-RU">
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" Title="Битрикс24 • Отчёт по сотруднику • 1.2.0" Width="1140" Height="880" MinWidth="940" MinHeight="660" WindowStartupLocation="CenterScreen" Background="#F3F5F8" FontFamily="Segoe UI" FontSize="14" Language="ru-RU">
  <Window.Resources>
   <SolidColorBrush x:Key="Muted" Color="#596779"/>
   <Style TargetType="TextBox"><Setter Property="Padding" Value="10,7"/><Setter Property="BorderBrush" Value="#CAD3DF"/><Setter Property="VerticalContentAlignment" Value="Center"/><Setter Property="Background" Value="White"/></Style>
@@ -322,7 +322,7 @@ try {
        <TextBlock x:Name="FolderHelp" Foreground="{StaticResource Muted}" TextWrapping="Wrap" FontSize="12" Margin="0,5,0,0"/>
        <Expander Header="Дополнительные параметры" Margin="0,16,0,0"><StackPanel Margin="0,5,0,0">
         <Label Content="Пояс исходных дат без UTC-смещения" Target="{Binding ElementName=InputTimeZone}"/><ComboBox x:Name="InputTimeZone" DisplayMemberPath="DisplayName" SelectedValuePath="Id"/>
-        <Grid><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="16"/><ColumnDefinition Width="*"/><ColumnDefinition Width="16"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions><StackPanel><Label Content="Часов в рабочем дне"/><TextBox x:Name="WorkdayHours" Text="8"/></StackPanel><StackPanel Grid.Column="2"><Label Content="Пауза запросов, мс"/><TextBox x:Name="Pause" Text="550"/></StackPanel><StackPanel Grid.Column="4"><Label Content="Попыток при ошибке"/><TextBox x:Name="Attempts" Text="4"/></StackPanel></Grid>
+        <Grid><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="16"/><ColumnDefinition Width="*"/><ColumnDefinition Width="16"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions><StackPanel><Label Content="Часов в рабочем дне"/><TextBox x:Name="WorkdayHours" Text="8"/></StackPanel><StackPanel Grid.Column="2"><Label Content="Пауза запросов, мс"/><TextBox x:Name="Pause" Text="1000"/></StackPanel><StackPanel Grid.Column="4"><Label Content="Попыток при ошибке"/><TextBox x:Name="Attempts" Text="4"/></StackPanel></Grid>
        </StackPanel></Expander>
       </StackPanel>
      </ScrollViewer>
@@ -466,6 +466,7 @@ function Read-ProcessLines([string]$Stream) {
         $line=$task.GetAwaiter().GetResult()
         if ($null -eq $line) {if ($Stream -eq 'Out') {$script:OutTask=$null} else {$script:ErrTask=$null};break}
         Add-UiLog $line
+        if (-not $script:CancelRequested -and $line -match '^\[(Ожидание API|API)\]') {$Ui.State.Text='Обрабатываем ограничение API';$Ui.StateHelp.Text=$line}
         if ($script:Job.Mode -eq 'Users' -and $line -like 'Загружено сотрудников:*') {$Ui.EmployeeHelp.Text=$line+'…'}
         if ($Stream -eq 'Out') {$script:OutTask=$script:Process.StandardOutput.ReadLineAsync()} else {$script:ErrTask=$script:Process.StandardError.ReadLineAsync()}
     }
@@ -480,7 +481,7 @@ function Update-SourceGrid {
         $data=Read-SharedJson $path;$script:LastStatus=$stamp
         $rows=@();$done=0;$errors=0
         foreach ($p in $data.PSObject.Properties) {
-            $state=switch ($p.Value.Status) {running {'Выполняется'} completed_with_limits {'Завершён с ограничениями'} partial {'Частично'} failed_or_unavailable {'Недоступен / ошибка'} interrupted {'Остановлен'} default {[string]$p.Value.Status}}
+            $state=switch ($p.Value.Status) {running {'Выполняется'} completed_with_limits {'Завершён с ограничениями'} partial {'Частично'} failed_or_unavailable {'Недоступен / ошибка'} deferred {'Отложен: лимит API'} interrupted {'Остановлен'} default {[string]$p.Value.Status}}
             if ($p.Value.Status -in @('completed_with_limits','partial','failed_or_unavailable')) {$done++}
             $rows+=[pscustomobject]@{Name=$p.Name;State=$state;Rows=$p.Value.Rows;Errors=$p.Value.Errors}
             $errors+=[int]$p.Value.Errors
