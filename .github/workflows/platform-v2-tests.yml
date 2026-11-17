@@ -24,6 +24,8 @@ jobs:
         with:
           python-version: '3.13'
       - name: Contracts, independent source queues, restart, auth and HTTP cancellation
+        id: regression
+        continue-on-error: true
         run: |
           python -m unittest -v test_platform.py
           if($LASTEXITCODE -ne 0){throw 'Platform regression failed'}
@@ -48,6 +50,10 @@ jobs:
           name: platform-windows-proof
           path: ${{ runner.temp }}/platform-proof/*.png
           if-no-files-found: ignore
+      - name: Require successful regression checks before publication
+        if: always()
+        run: |
+          if('${{ steps.regression.outcome }}' -ne 'success'){throw 'Regression checks did not pass; archive will not be published'}
       - name: Verify the ZIP payload and publish the tested archive
         run: |
           python -c "import zipfile,json,hashlib; z=zipfile.ZipFile('../bitrix24_gui.zip'); m=json.loads(z.read('build_manifest.json')); assert all(hashlib.sha256(z.read(k)).hexdigest()==v for k,v in m['files'].items()); assert m['source_commit']==__import__('os').environ['GITHUB_SHA']; print('ARCHIVE VERIFIED')"

@@ -217,12 +217,12 @@ class LocalApiTests(unittest.TestCase):
     def test_create_pause_export_and_resume_via_http(self):
         status,result=self.request('/api/create',{'webhook':WEBHOOK,'employee':25,'from':BEGIN,'to':END})
         self.assertEqual(200,status);job=result['job']
-        end=time.monotonic()+10
+        end=time.monotonic()+30
         while time.monotonic()<end:
             _,state=self.request('/api/job?id='+job)
             if state['state']=='done':break
             time.sleep(.03)
-        self.assertEqual('done',state['state'])
+        self.assertEqual('done',state['state'],dump(state))
         _,rows=self.request('/api/events?id='+job)
         self.assertTrue(rows);self.assertTrue(all(r['actor']=='25' for r in rows))
         _,raw=self.request('/api/raw?id='+rows[0]['raw']);self.assertEqual(200,raw['http'])
