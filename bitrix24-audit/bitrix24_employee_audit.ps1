@@ -38,8 +38,9 @@ $script:LastRef = ''
 $script:NetworkCalls = 0
 $script:CachedCalls = 0
 $script:IncompleteRun = $true
-$script:AppVersion='1.2.0'
+$script:AppVersion='1.3.0'
 $script:EventUserOnlyDone=$false
+$script:GrantedScopes=$null
 $script:RateBlocked=@{}
 $script:Deferred=New-Object Collections.Generic.List[object]
 $script:RetryingDeferred=$false
@@ -222,7 +223,7 @@ function Invoke-Api([string]$Method, $Payload, [int]$Version=2) {
     $relative = "raw/$Method-$cacheKey.json"
     $path = Join-Path $OutputDir $relative
     $script:LastRef = $relative
-    if (Test-Path -LiteralPath $path) {
+    if ((Test-Path -LiteralPath $path) -and ($Method -ne 'scope' -or $RebuildOnly -or $SelfTest)) {
         $saved = Read-Json ([IO.File]::ReadAllText($path))
         if ($saved.Request.Method -ne $Method -or $saved.Request.Body -ne $body -or $saved.Request.Version -ne $Version) { throw 'Поврежден checkpoint запроса' }
         Validate-Response $Method $saved.Response
@@ -239,6 +240,7 @@ function Invoke-Api([string]$Method, $Payload, [int]$Version=2) {
         try {
             if ($PauseMilliseconds -gt 0) { Start-Sleep -Milliseconds $PauseMilliseconds }
             Write-Progress -Activity $script:CurrentSource -Status "$Method — попытка $attempt/$MaxAttempts; сохранённых страниц: $script:CachedCalls"
+            Write-Host "[Прогресс] $script:CurrentSource | метод=$Method | событий=$($script:Rows.Count) | запросов=$script:NetworkCalls"
             $script:NetworkCalls++
             # Bytes keep UTF-8 behavior identical in Windows PowerShell 5.1 and PowerShell 7.
             $webResponse = Invoke-AuditHttp -UseBasicParsing -Method Post -Uri $url -ContentType 'application/json; charset=utf-8' -Body ([Text.Encoding]::UTF8.GetBytes($body)) -TimeoutSec 90 -MaximumRedirection 0 -ErrorAction Stop
@@ -343,7 +345,15 @@ function Run-Source([string]$Name,[string]$Limit,[scriptblock]$Body) {
     $script:Status[$Name]=[ordered]@{Status='running';PagesScope='Только объекты, видимые владельцу вебхука';Limit=$Limit;Errors=0;Rows=0}
     Save-Json (Join-Path $OutputDir 'status.json') $script:Status
     Write-Host "`n[$Name] $Limit" -ForegroundColor Cyan
-    try { & $Body } catch {
+    try {
+        $required=switch ($Name) {
+            'Event Log' {'main'} 'История задач' {'task'} 'Трудозатраты' {'task'}
+            'CRM-дела' {'crm'} 'CRM-объекты и комментарии' {'crm'} 'Диск' {'disk'}
+            'Контроль времени' {'timeman'} 'Рабочее время REST 3.0' {'timeman'} 'Телефония' {'telephony'} 'Шаблоны бизнес-процессов' {'bizproc'}
+        }
+        if ($required -and $null -ne $script:GrantedScopes -and $required -notin $script:GrantedScopes) {throw "Нет права $required у используемого вебхука. Фактически выданы: $($script:GrantedScopes -join ', '). Сохраните нужное право в Битрикс24 и скопируйте адрес именно этого вебхука; права владельца не заменяют scope."}
+        & $Body
+    } catch {
         Note-Error $Name $_.Exception.Message -SourceBoundary
         if (Is-RateLimit $_.Exception.Message) {
             $script:Status[$Name].Status='deferred'
@@ -356,6 +366,7 @@ function Run-Source([string]$Name,[string]$Limit,[scriptblock]$Body) {
     elseif ($s.Errors -gt 0) { $s.Status=if ($s.Rows -gt 0) {'partial'} else {'failed_or_unavailable'} }
     else { $s.Status='completed_with_limits' }
     Save-Json (Join-Path $OutputDir 'status.json') $script:Status
+    Export-Report
 }
 $TaskActions=@{
  NEW='Создал задачу'; DELETE='Удалил задачу'; RENEW='Восстановил задачу'; COMMENT='Добавил комментарий к задаче'
@@ -624,7 +635,7 @@ function Export-Report {
         if ($script:Status[$name].Status -eq 'running') { $script:Status[$name].Status='interrupted' }
     }
     Save-Json (Join-Path $OutputDir 'status.json') $script:Status
-    $summary=[ordered]@{AppVersion=$script:AppVersion;EventLogLocalDateFilter=$script:EventUserOnlyDone;EmployeeId=$EmployeeId;From=$script:Begin.ToString('o');ToExclusive=$script:End.ToString('o');TimeZone=$TimeZoneId;InputTimeZone=$InputTimeZoneId;Rows=$sorted.Count;Errors=(@($script:Status.Values | ForEach-Object {$_.Errors})|Measure-Object -Sum).Sum;ErrorHistoryCount=$script:Errors.Count;Rejected=$script:Rejected.Count;NetworkCalls=$script:NetworkCalls;CachedCalls=$script:CachedCalls;Interrupted=$script:IncompleteRun;FullPortalHistoryConfirmed=$false;Sources=$script:Status;Gaps=@(
+    $summary=[ordered]@{AppVersion=$script:AppVersion;EventLogLocalDateFilter=$script:EventUserOnlyDone;GrantedScopes=$script:GrantedScopes;EmployeeId=$EmployeeId;From=$script:Begin.ToString('o');ToExclusive=$script:End.ToString('o');TimeZone=$TimeZoneId;InputTimeZone=$InputTimeZoneId;Rows=$sorted.Count;Errors=(@($script:Status.Values | ForEach-Object {$_.Errors})|Measure-Object -Sum).Sum;ErrorHistoryCount=$script:Errors.Count;Rejected=$script:Rejected.Count;NetworkCalls=$script:NetworkCalls;CachedCalls=$script:CachedCalls;Interrupted=$script:IncompleteRun;FullPortalHistoryConfirmed=$false;Sources=$script:Status;Gaps=@(
         'Доступ и сроки хранения ограничивают любой источник. completed_with_limits означает завершение обхода доступных объектов, а не полную историю портала.'
         'Удалённые/скрытые задачи и элементы CRM могут не попасть в перечисление, даже у администратора. Скрипт не обходит права доступа.'
         'Старые комментарии доступны только через существующие родительские элементы. Метаданные не содержат промежуточных изменений.'
@@ -686,6 +697,7 @@ function Install-TestTransport {
         $script:TestCalls[$name]=1+[int]$script:TestCalls[$name]
         $empty=@();$ts='2026-10-02T10:00:00+03:00'
         switch ($name) {
+            'scope' {return [pscustomobject]@{result=@('task','main','crm','disk','timeman','telephony','bizproc','user_brief')}}
             'profile' { return [pscustomobject]@{result=@{ID='1';ADMIN=$true}} }
             'main.eventlog.list' {
                 if ($b.pagination.page -gt 1) { return [pscustomobject]@{result=@{items=$empty}} }
@@ -805,6 +817,7 @@ try {
         foreach ($property in $limits.PSObject.Properties) {$script:RateBlocked[$property.Name]=[string]$property.Value}
     }
     Save-Json (Join-Path $OutputDir 'manifest.json') $manifest
+    Write-Host "[Версия] $script:AppVersion; портал $script:Portal; владелец вебхука ID $owner"
     Write-Host "Сотрудник: $EmployeeId; период [$($script:Begin.ToString('o')), $($script:End.ToString('o'))); зона: $TimeZoneId"
     Write-Host "Каталог: $OutputDir. Успешные страницы сохраняются сразу. Для продолжения: -Resume -OutputDir <этот каталог>"
     if ($SelfTest) { Test-Normalization }
@@ -813,21 +826,34 @@ try {
             $profile=Invoke-Api 'profile' ([ordered]@{})
             if ([string]$profile.result.ID -ne [string]$owner) { throw 'Владелец вебхука не совпадает с profile.ID' }
             if ($profile.result.ADMIN -ne $true -and [string]$profile.result.ADMIN -ne 'Y') { Write-Warning 'Владелец вебхука не подтверждён как администратор. Отчёт ограничен его правами.' }
+            $grants=Invoke-Api 'scope' ([ordered]@{})
+            $script:GrantedScopes=@($grants.result)
+            $missing=@(@('task','crm','disk','timeman','telephony','bizproc','main')|Where-Object {$_ -notin $script:GrantedScopes})
+            Save-Json (Join-Path $OutputDir 'access_check.json') ([ordered]@{CheckedAt=[DateTimeOffset]::UtcNow.ToString('o');Portal=$script:Portal;OwnerId=$owner;Admin=$profile.result.ADMIN;Granted=$script:GrantedScopes;Missing=$missing;ExpectedTaskScope='task';ScopeRequest='scope без full: true'})
+            Write-Host "[Права вебхука] $($script:GrantedScopes -join ', ')"
+            if ($missing.Count) {Write-Warning "У вебхука не выданы: $($missing -join ', '). Источники без этих прав не запрашиваются."}
+            if ('tasks' -in $script:GrantedScopes -and 'task' -notin $script:GrantedScopes) {Write-Warning 'tasks и task — разные коды. Для tasks.task.list нужен именно task.'}
+            if ('task' -in $script:GrantedScopes) {
+                # Same first-page request as the collector: validates the method and warms its checkpoint.
+                try {$null=Invoke-Api 'tasks.task.list' ([ordered]@{order=@{ID='ASC'};filter=@{};select=@('ID','TITLE');start=0})}
+                catch {Note-Error 'Проверка tasks.task.list' $_.Exception.Message}
+            }
+
         }
+        Run-Source 'CRM-дела' 'Создание и последнее изменение. Legacy REST 2.0: сохраняет поля автора/редактора и провайдера' { Collect-Activities }
+        Run-Source 'Контроль времени' 'Данные месячных отчётов и наблюдения приложения; настройка может быть выключена' { Collect-Timecontrol }
+        Run-Source 'Рабочее время REST 3.0' 'Начало/конец доступных интервалов сотрудника; не журнал всех корректировок' { Collect-WorkRecords }
+        Run-Source 'Телефония' 'История звонков, связанных с сотрудником; без скачивания записей разговоров' { Collect-Calls }
+        Run-Source 'Шаблоны бизнес-процессов' 'Текущая структура шаблонов и последнее создание/изменение по USER_ID; не история роботов и прав' { Collect-Configuration }
+        Run-Source 'История задач' 'Все перечисленные доступные задачи; фильтрация по user.id автора изменения' { Collect-Tasks 'history' }
+        Run-Source 'Трудозатраты' 'Записи от имени сотрудника; даты ручного учёта могут отличаться от времени внесения' { Collect-Tasks 'elapsed' }
+        Run-Source 'Диск' 'Доступные хранилища и вложенные папки; только метаданные, не полная история версий' { Collect-Disk }
+        Run-Source 'CRM-объекты и комментарии' 'Лиды, сделки, контакты, компании, предложения, счета, обнаруженные смарт-процессы; комментарии всех видимых элементов' { Collect-Crm }
         Run-Source 'Event Log' 'События, сохранённые журналом за период; зависит от тарифа и срока хранения' {
             $script:EventUserOnlyDone=$false
             $left=$script:Begin
             while ($left -lt $script:End) { $right=$left.AddHours($EventWindowHours);if ($right -gt $script:End) {$right=$script:End};Read-EventWindow $left $right;if($script:EventUserOnlyDone){break};$left=$right }
         }
-        Run-Source 'История задач' 'Все перечисленные доступные задачи; фильтрация по user.id автора изменения' { Collect-Tasks 'history' }
-        Run-Source 'Трудозатраты' 'Записи от имени сотрудника; даты ручного учёта могут отличаться от времени внесения' { Collect-Tasks 'elapsed' }
-        Run-Source 'CRM-дела' 'Создание и последнее изменение. Legacy REST 2.0: сохраняет поля автора/редактора и провайдера' { Collect-Activities }
-        Run-Source 'CRM-объекты и комментарии' 'Лиды, сделки, контакты, компании, предложения, счета, обнаруженные смарт-процессы; комментарии всех видимых элементов' { Collect-Crm }
-        Run-Source 'Диск' 'Доступные хранилища и вложенные папки; только метаданные, не полная история версий' { Collect-Disk }
-        Run-Source 'Контроль времени' 'Данные месячных отчётов и наблюдения приложения; настройка может быть выключена' { Collect-Timecontrol }
-        Run-Source 'Рабочее время REST 3.0' 'Начало/конец доступных интервалов сотрудника; не журнал всех корректировок' { Collect-WorkRecords }
-        Run-Source 'Телефония' 'История звонков, связанных с сотрудником; без скачивания записей разговоров' { Collect-Calls }
-        Run-Source 'Шаблоны бизнес-процессов' 'Текущая структура шаблонов и последнее создание/изменение по USER_ID; не история роботов и прав' { Collect-Configuration }
         Retry-Deferred
         $script:IncompleteRun=$false
     } finally { Export-Report }

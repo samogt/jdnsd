@@ -265,7 +265,7 @@ Add-Type -AssemblyName PresentationFramework,PresentationCore,WindowsBase,System
 if ([Threading.Thread]::CurrentThread.ApartmentState -ne 'STA') { throw 'Запустите START_GUI.cmd или PowerShell с параметром -STA.' }
 try {
 [xml]$xaml=@'
-<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" Title="Битрикс24 • Отчёт по сотруднику • 1.2.0" Width="1140" Height="880" MinWidth="940" MinHeight="660" WindowStartupLocation="CenterScreen" Background="#F3F5F8" FontFamily="Segoe UI" FontSize="14" Language="ru-RU">
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" Title="Битрикс24 • Отчёт по сотруднику • 1.3.0" Width="1140" Height="880" MinWidth="940" MinHeight="660" WindowStartupLocation="CenterScreen" Background="#F3F5F8" FontFamily="Segoe UI" FontSize="14" Language="ru-RU">
  <Window.Resources>
   <SolidColorBrush x:Key="Muted" Color="#596779"/>
   <Style TargetType="TextBox"><Setter Property="Padding" Value="10,7"/><Setter Property="BorderBrush" Value="#CAD3DF"/><Setter Property="VerticalContentAlignment" Value="Center"/><Setter Property="Background" Value="White"/></Style>
@@ -466,6 +466,8 @@ function Read-ProcessLines([string]$Stream) {
         $line=$task.GetAwaiter().GetResult()
         if ($null -eq $line) {if ($Stream -eq 'Out') {$script:OutTask=$null} else {$script:ErrTask=$null};break}
         Add-UiLog $line
+        if (-not $script:CancelRequested -and $line -match '^\[Прогресс\].*событий=(\d+)') {$Ui.State.Text='Собираем доступные события';$Ui.StateHelp.Text=$line;$Ui.EventCount.Text=$Matches[1]}
+        if ($line -match '^\[Права вебхука\]') {$Ui.StateHelp.Text=$line}
         if (-not $script:CancelRequested -and $line -match '^\[(Ожидание API|API)\]') {$Ui.State.Text='Обрабатываем ограничение API';$Ui.StateHelp.Text=$line}
         if ($script:Job.Mode -eq 'Users' -and $line -like 'Загружено сотрудников:*') {$Ui.EmployeeHelp.Text=$line+'…'}
         if ($Stream -eq 'Out') {$script:OutTask=$script:Process.StandardOutput.ReadLineAsync()} else {$script:ErrTask=$script:Process.StandardError.ReadLineAsync()}
