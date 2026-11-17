@@ -27,6 +27,16 @@ jobs:
             $null=[Management.Automation.Language.Parser]::ParseFile($_.FullName,[ref]$tokens,[ref]$errors)
             if($errors.Count){throw ($errors|Out-String)}
           }
+      - name: Verify downloaded ZIP matches tested source files
+        run: |
+          $destination=Join-Path $env:RUNNER_TEMP 'audit-package'
+          Expand-Archive ./bitrix24_gui.zip -DestinationPath $destination
+          Get-ChildItem $destination -File | ForEach-Object {
+            $reference=Join-Path $pwd $_.Name
+            if(-not (Test-Path $reference)){throw "Unexpected archive file: $($_.Name)"}
+            if((Get-FileHash $_.FullName).Hash -ne (Get-FileHash $reference).Hash){throw "Stale archive file: $($_.Name)"}
+          }
+          if(-not (Test-Path (Join-Path $destination 'START_GUI.cmd'))){throw 'Archive missing launcher'}
       - name: GUI process, parameters, cancellation, employee list
         if: always()
         run: ./bitrix24_gui.ps1 -SelfTest

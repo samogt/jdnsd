@@ -570,7 +570,7 @@ function Collect-Tasks([string]$Kind) {
         if($script:Status.Contains($script:CurrentSource)) {
             $script:Status[$script:CurrentSource].Rows=@($script:Rows|Where-Object {$_.'Источник' -eq $script:CurrentSource}).Count
             Save-Json (Join-Path $OutputDir 'status.json') $script:Status
-            Export-Report
+            Export-Report -Live
         }
     }
 }
@@ -732,6 +732,7 @@ function Collect-WorkRecords {
 }
 function Html([string]$Text) { [Net.WebUtility]::HtmlEncode($Text) }
 function Export-Report {
+    param([switch]$Live)
     $sorted=@($script:Rows | Sort-Object UTC,'ID события')
     $csvPath=Join-Path $OutputDir "timeline_employee_$EmployeeId.csv"
     # UTF-8 BOM and semicolon support Russian Excel; neutralize spreadsheet formulas in all text cells.
@@ -750,7 +751,7 @@ function Export-Report {
     Save-Json (Join-Path $OutputDir 'collection_errors.json') @($script:Errors.ToArray())
     Save-Json (Join-Path $OutputDir 'rejected.json') @($script:Rejected.ToArray())
     foreach ($name in @($script:Status.Keys)) {
-        if ($script:Status[$name].Status -eq 'running') { $script:Status[$name].Status='interrupted' }
+        if (-not $Live -and $script:Status[$name].Status -eq 'running') { $script:Status[$name].Status='interrupted' }
     }
     Save-Json (Join-Path $OutputDir 'status.json') $script:Status
     $diagnosis=Save-Diagnosis

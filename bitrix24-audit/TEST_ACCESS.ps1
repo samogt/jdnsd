@@ -18,3 +18,10 @@ if($script:Rows.Count -ne 1 -or $script:Status['CRM-дела'].Status -ne 'compl
 $report=Read-Json ([IO.File]::ReadAllText((Join-Path $OutputDir 'summary.json')))
 if($report.Rows -ne 1 -or $report.AppVersion -ne '1.5.0'){throw 'Incremental report was not exported'}
 Write-Host 'ACCESS TEST PASSED: fresh scope, tasks != task, no request to unavailable task source, other sources continue, incremental report.'
+
+$script:Status['Live test']=[ordered]@{Status='running';Rows=0;Errors=0;Limit='test'}
+Export-Report -Live
+if($script:Status['Live test'].Status -ne 'running'){throw 'Live checkpoint incorrectly marked an active source as interrupted'}
+Export-Report
+if($script:Status['Live test'].Status -ne 'interrupted'){throw 'Final export must mark unfinished sources as interrupted'}
+Write-Host 'REPORT CHECKPOINT TEST PASSED: live and final status semantics.'
