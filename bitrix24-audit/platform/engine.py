@@ -8,6 +8,7 @@ import email.utils
 import gzip
 import hashlib
 import http.client
+import io
 import json
 import re
 import secrets
@@ -65,6 +66,40 @@ def iso(value):
     return value.astimezone(UTC).isoformat(timespec='microseconds')
 
 
+class _ResponseReader(io.RawIOBase):
+    """Keep HTTP buffering intact while polling cancellation between socket reads."""
+    def __init__(self, wire, cancelled):
+        self.wire, self.cancelled = wire, cancelled
+
+    def readable(self):
+        return True
+
+    def readinto(self, buffer):
+        while True:
+            if self.cancelled():
+                raise OSError('HTTP request cancelled')
+            try:
+                return self.wire.recv_into(buffer)
+            except (socket.timeout, ssl.SSLWantReadError):
+                # Retry the socket, never a timed-out socket.makefile() buffer.
+                continue
+
+
+class _ResponseSocket:
+    def __init__(self, wire, cancelled):
+        self.wire, self.cancelled = wire, cancelled
+
+    def makefile(self, mode):
+        if mode != 'rb':
+            raise ValueError('Only HTTP response reading is supported')
+        return io.BufferedReader(_ResponseReader(self.wire, self.cancelled))
+
+    def close(self):
+        # HTTP/1.0 detaches its connection before reading the body. PortalClient
+        # owns the real socket until the response has been read or cancelled.
+        pass
+
+
 class PortalClient:
     gate = threading.Lock()
     next_allowed = 0.0
@@ -85,15 +120,6 @@ class PortalClient:
         with self.lock:
             selected = set(self.connections) if keys is None else set(keys)
             self.cancelled.update(selected)
-            connections = [c for k,c in self.connections.items() if k in selected and c is not None]
-        for connection in connections:
-            try:
-                wire = getattr(connection, 'audit_socket', None) or connection.sock
-                if wire:
-                    wire.shutdown(socket.SHUT_RDWR)
-                connection.close()
-            except OSError:
-                pass
 
     def call(self, method, body, version=2, key=None):
         key = key or secrets.token_hex(12)
@@ -126,13 +152,12 @@ class PortalClient:
         timer = threading.Timer(self.timeout, lambda: self.cancel([key]))
         timer.daemon = True
         timer.start()
+        wire = None
         try:
             connection.request('POST', path, dump(body).encode(), {'Content-Type': 'application/json; charset=utf-8', 'Accept': 'application/json', 'Accept-Encoding': 'identity'})
-            # HTTPResponse may detach/close connection.sock after headers. Keep an independent
-            # control handle to the same TCP connection so shutdown also interrupts body reads
-            # on Windows. The control socket never reads or writes TLS data.
             wire = connection.sock
-            connection.audit_socket = socket.socket(wire.family, wire.type, wire.proto, fileno=socket.dup(wire.fileno()))
+            wire.settimeout(.25)
+            connection.sock = _ResponseSocket(wire, lambda: key in self.cancelled)
             with self.lock:
                 if key in self.cancelled:
                     return 0, {}, {'error': 'CANCELLED', 'error_description': 'Запрос приостановлен'}
@@ -152,9 +177,8 @@ class PortalClient:
         finally:
             timer.cancel()
             connection.close()
-            control = getattr(connection, 'audit_socket', None)
-            if control:
-                control.close()
+            if wire:
+                wire.close()
             with self.lock:
                 self.connections.pop(key, None)
 

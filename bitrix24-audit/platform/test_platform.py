@@ -4,7 +4,10 @@ import http.client
 import http.server
 import io
 import json
+import shutil
 import sqlite3
+import ssl
+import subprocess
 import tempfile
 import threading
 import time
@@ -239,6 +242,44 @@ class LocalApiTests(unittest.TestCase):
 
 
 class TransportTests(unittest.TestCase):
+    def test_tls_fragmented_headers_and_chunked_body_survive_polling(self):
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self,*args):pass
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get('Content-Length',0)))
+                # A partial status line and a partial JSON body each cross several
+                # receive-poll deadlines. Neither may corrupt HTTP/TLS buffering.
+                self.wfile.write(b'HTTP/1.1 200');self.wfile.flush();time.sleep(.65)
+                self.wfile.write(b' OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n')
+                self.wfile.write(b'7\r\n{"resul\r\n');self.wfile.flush();time.sleep(.65)
+                part=b't":{"ok":true}}'
+                self.wfile.write(hex(len(part))[2:].encode()+b'\r\n'+part+b'\r\n0\r\n\r\n');self.wfile.flush()
+        openssl=shutil.which('openssl')
+        if not openssl:
+            openssl=next((str(p) for p in (Path(r'C:\Program Files\Git\usr\bin\openssl.exe'),Path(r'C:\Program Files\Git\mingw64\bin\openssl.exe')) if p.is_file()),None)
+        self.assertTrue(openssl,'TLS integration check requires the CI OpenSSL executable')
+        temporary=tempfile.TemporaryDirectory(prefix='bitrix-test-tls-')
+        self.addCleanup(temporary.cleanup)
+        cert,key=Path(temporary.name)/'cert.pem',Path(temporary.name)/'key.pem'
+        subprocess.run([openssl,'req','-x509','-newkey','rsa:2048','-keyout',str(key),'-out',str(cert),'-days','1','-nodes','-subj','/CN=localhost'],check=True,capture_output=True)
+        server=http.server.ThreadingHTTPServer(('127.0.0.1',0),Handler)
+        context=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(str(cert),str(key))
+        server.socket=context.wrap_socket(server.socket,server_side=True)
+        thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+        original_connect=http.client.HTTPSConnection.connect
+        def connect(connection):
+            connection.host,connection.port='127.0.0.1',server.server_port
+            connection._context=ssl._create_unverified_context()
+            original_connect(connection)
+        try:
+            with patch.object(http.client.HTTPSConnection,'connect',connect),patch('engine.urllib.request.getproxies',return_value={}):
+                PortalClient.next_allowed=0
+                status,_,body=PortalClient(WEBHOOK,timeout=5).call('probe.tls',{})
+                self.assertEqual(200,status);self.assertEqual({'result':{'ok':True}},body)
+        finally:
+            server.shutdown();server.server_close()
+
     def test_real_http_error_bodies_and_cancellation_after_headers(self):
         class Handler(http.server.BaseHTTPRequestHandler):
             def log_message(self,*args):pass

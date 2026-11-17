@@ -25,7 +25,6 @@ jobs:
           python-version: '3.13'
       - name: Contracts, independent source queues, restart, auth and HTTP cancellation
         id: regression
-        continue-on-error: true
         run: |
           python -m unittest -v test_platform.py
           if($LASTEXITCODE -ne 0){throw 'Platform regression failed'}
