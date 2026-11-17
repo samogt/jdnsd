@@ -16,6 +16,9 @@ jobs:
         shell: powershell
         working-directory: bitrix24-audit
     steps:
+      - name: Preserve the exact release file bytes during checkout
+        working-directory: .
+        run: git config --global core.autocrlf false
       - uses: actions/checkout@v4
       - name: Check native PowerShell and parse every script
         run: |
