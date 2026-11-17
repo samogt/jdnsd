@@ -38,8 +38,10 @@ $script:LastRef = ''
 $script:NetworkCalls = 0
 $script:CachedCalls = 0
 $script:IncompleteRun = $true
-$script:AppVersion='1.3.0'
+$script:AppVersion='1.4.0'
 $script:EventUserOnlyDone=$false
+$script:HistoryStats=[ordered]@{Records=0;ActorMissing=0;EmployeeRecords=0;EmployeeInPeriod=0;EmployeeOutsidePeriod=0;InvalidDates=0;MinDate='';MaxDate='';Actors=@{}}
+$script:HistorySeen=@{}
 $script:GrantedScopes=$null
 $script:RateBlocked=@{}
 $script:Deferred=New-Object Collections.Generic.List[object]
@@ -204,6 +206,35 @@ function Add-Event {
     $script:Seen[$Key] = $true
     $script:Rows.Add($row)
 }
+function Measure-History($Event,[string]$TaskId) {
+    $key="$TaskId/$($Event.id)"
+    if (-not $Event.id) {$key="$TaskId/$(Hash (Json $Event))"}
+    if ($script:HistorySeen.ContainsKey($key)) {return}
+    $script:HistorySeen[$key]=$true;$h=$script:HistoryStats;$h.Records++
+    $actor=[string]$Event.user.id
+    if (-not $actor) {$h.ActorMissing++} else {$h.Actors[$actor]=1+[int]$h.Actors[$actor]}
+    if ($actor -eq [string]$EmployeeId) {$h.EmployeeRecords++}
+    try {
+        $date=Parse-Date ([string]$Event.createdDate);$utc=$date.UtcDateTime.ToString('o')
+        if (-not $h.MinDate -or $utc -lt $h.MinDate) {$h.MinDate=$utc}
+        if (-not $h.MaxDate -or $utc -gt $h.MaxDate) {$h.MaxDate=$utc}
+        if ($actor -eq [string]$EmployeeId) {
+            if ($date -ge $script:Begin -and $date -lt $script:End) {$h.EmployeeInPeriod++} else {$h.EmployeeOutsidePeriod++}
+        }
+    } catch {$h.InvalidDates++}
+}
+function Save-Diagnosis {
+    $h=$script:HistoryStats
+    $reason=if ($h.Records -eq 0) {'История задач ещё не получена либо получены пустые ответы. Проверьте статус источника.'}
+        elseif ($h.EmployeeRecords -eq 0) {"В прочитанных историях автор ID $EmployeeId не встретился. Это не доказывает отсутствие его действий в ещё не проверенных объектах."}
+        elseif ($h.EmployeeInPeriod -eq 0) {'Записи сотрудника найдены, но среди разобранных дат нет попаданий в выбранный период.'}
+        else {"В прочитанных историях найдено $($h.EmployeeInPeriod) записей выбранного сотрудника за период."}
+    if ($h.ActorMissing -gt 0 -or $h.InvalidDates -gt 0) {$reason+=' Есть записи с нераспознанным автором или датой; полнота не подтверждается.'}
+    if ($script:IncompleteRun) {$reason+=' Сбор ещё не завершён или был остановлен: вывод относится только к прочитанным данным.'}
+    $d=[ordered]@{AppVersion=$script:AppVersion;EmployeeId=$EmployeeId;From=$script:Begin.ToString('o');ToExclusive=$script:End.ToString('o');History=$h;Explanation=$reason;Partial=[bool]$script:IncompleteRun;Scope='Только реально прочитанные истории задач; не весь портал'}
+    Save-Json (Join-Path $OutputDir 'diagnosis.json') $d
+    return $d
+}
 function Validate-Response([string]$Method,$Data) {
     if (-not (Has $Data 'result') -or $null -eq $Data.result -or $Data.result -is [bool]) { throw "${Method}: отсутствует допустимый result" }
     if ($Method -eq 'timeman.timecontrol.reports.get') {
@@ -222,6 +253,13 @@ function Invoke-Api([string]$Method, $Payload, [int]$Version=2) {
     $cacheKey = Hash "$Version|$Method|$body"
     $relative = "raw/$Method-$cacheKey.json"
     $path = Join-Path $OutputDir $relative
+    if (-not (Test-Path -LiteralPath $path) -and ($Method -eq 'tasks.task.history.list' -or ($RebuildOnly -and $Method -eq 'tasks.task.list'))) {
+        $legacy=[ordered]@{};foreach($k in $Payload.Keys){$legacy[$k]=$Payload[$k]}
+        if ($Method -eq 'tasks.task.history.list' -and -not $legacy.Contains('start')) {$legacy.start=0}
+        if ($Method -eq 'tasks.task.list') {$legacy.order=@{ID='ASC'}}
+        $legacyBody=Json (Canonical $legacy);$legacyRef="raw/$Method-$(Hash "$Version|$Method|$legacyBody").json"
+        if (Test-Path -LiteralPath (Join-Path $OutputDir $legacyRef)) {$relative=$legacyRef;$path=Join-Path $OutputDir $relative;$body=$legacyBody}
+    }
     $script:LastRef = $relative
     if ((Test-Path -LiteralPath $path) -and ($Method -ne 'scope' -or $RebuildOnly -or $SelfTest)) {
         $saved = Read-Json ([IO.File]::ReadAllText($path))
@@ -240,7 +278,7 @@ function Invoke-Api([string]$Method, $Payload, [int]$Version=2) {
         try {
             if ($PauseMilliseconds -gt 0) { Start-Sleep -Milliseconds $PauseMilliseconds }
             Write-Progress -Activity $script:CurrentSource -Status "$Method — попытка $attempt/$MaxAttempts; сохранённых страниц: $script:CachedCalls"
-            Write-Host "[Прогресс] $script:CurrentSource | метод=$Method | событий=$($script:Rows.Count) | запросов=$script:NetworkCalls"
+            Write-Host "[Прогресс] $script:CurrentSource | метод=$Method | событий=$($script:Rows.Count) | запросов=$script:NetworkCalls | история=$($script:HistoryStats.Records), автор=$($script:HistoryStats.EmployeeRecords), период=$($script:HistoryStats.EmployeeInPeriod)"
             $script:NetworkCalls++
             # Bytes keep UTF-8 behavior identical in Windows PowerShell 5.1 and PowerShell 7.
             $webResponse = Invoke-AuditHttp -UseBasicParsing -Method Post -Uri $url -ContentType 'application/json; charset=utf-8' -Body ([Text.Encoding]::UTF8.GetBytes($body)) -TimeoutSec 90 -MaximumRedirection 0 -ErrorAction Stop
@@ -300,12 +338,12 @@ function Invoke-Api([string]$Method, $Payload, [int]$Version=2) {
 }
 function Get-Pages {
     param([string]$Method,[System.Collections.IDictionary]$Payload,[string]$Items='',
-        [ValidateSet('Next','Fixed','V3')][string]$Mode='Next',[int]$Size=50)
+        [ValidateSet('Next','Fixed','V3','History')][string]$Mode='Next',[int]$Size=50)
     $position=0; $page=1; $previous=''; $seenPositions=@{}
     while ($true) {
         $body=[ordered]@{}; foreach ($k in $Payload.Keys) { $body[$k]=$Payload[$k] }
         if ($Mode -eq 'V3') { $body.pagination=@{page=$page;limit=$Size} }
-        else { $body.start=$position }
+        elseif ($Mode -ne 'History' -or $position -gt 0) { $body.start=$position }
         $version=2; if ($Mode -eq 'V3') { $version=3 }
         $response=Invoke-Api $Method $body $version
         if (-not (Has $response 'result')) { throw "${Method}: отсутствует result" }
@@ -322,7 +360,7 @@ function Get-Pages {
         $previous=$fingerprint
         # Wrap the batch to retain its exact raw reference even when a caller makes nested API calls.
         [pscustomobject]@{Items=$batch;Raw=$script:LastRef}
-        if ($Mode -eq 'Next') {
+        if ($Mode -in @('Next','History')) {
             $next=Value $response 'next'
             if ($null -eq $next) {
                 $total=Value $response 'total'
@@ -414,15 +452,16 @@ function Read-EventWindow([DateTimeOffset]$Left,[DateTimeOffset]$Right,[switch]$
     }
 }
 function Collect-Tasks([string]$Kind) {
-    Get-Pages 'tasks.task.list' ([ordered]@{order=@{ID='ASC'};filter=@{};select=@('ID','TITLE')}) 'tasks' | ForEach-Object {
+    Get-Pages 'tasks.task.list' ([ordered]@{order=@{CHANGED_DATE='DESC';ID='DESC'};filter=@{};select=@('ID','TITLE')}) 'tasks' | ForEach-Object {
         foreach ($task in $_.Items) {
             $id=[string]$task.id; $label="Задача #$id — $($task.title)"
             if (-not $id) { throw 'Список задач: пустой id' }
             try {
                 if ($Kind -eq 'history') {
-                    Get-Pages 'tasks.task.history.list' ([ordered]@{taskId=[int]$id;order=@{createdDate='ASC'}}) 'list' 'Fixed' | ForEach-Object {
+                    Get-Pages 'tasks.task.history.list' ([ordered]@{taskId=[int]$id;order=@{createdDate='ASC'}}) 'list' 'History' | ForEach-Object {
                         $script:LastRef=$_.Raw
                         foreach ($event in $_.Items) {
+                            Measure-History $event $id
                             if ([string]$event.user.id -ne [string]$EmployeeId) { continue }
                             $field=[string]$event.field; $action=$TaskActions[$field]
                             if (-not $action) { $action="Изменил параметр задачи: $field" }
@@ -635,6 +674,7 @@ function Export-Report {
         if ($script:Status[$name].Status -eq 'running') { $script:Status[$name].Status='interrupted' }
     }
     Save-Json (Join-Path $OutputDir 'status.json') $script:Status
+    $diagnosis=Save-Diagnosis
     $summary=[ordered]@{AppVersion=$script:AppVersion;EventLogLocalDateFilter=$script:EventUserOnlyDone;GrantedScopes=$script:GrantedScopes;EmployeeId=$EmployeeId;From=$script:Begin.ToString('o');ToExclusive=$script:End.ToString('o');TimeZone=$TimeZoneId;InputTimeZone=$InputTimeZoneId;Rows=$sorted.Count;Errors=(@($script:Status.Values | ForEach-Object {$_.Errors})|Measure-Object -Sum).Sum;ErrorHistoryCount=$script:Errors.Count;Rejected=$script:Rejected.Count;NetworkCalls=$script:NetworkCalls;CachedCalls=$script:CachedCalls;Interrupted=$script:IncompleteRun;FullPortalHistoryConfirmed=$false;Sources=$script:Status;Gaps=@(
         'Доступ и сроки хранения ограничивают любой источник. completed_with_limits означает завершение обхода доступных объектов, а не полную историю портала.'
         'Удалённые/скрытые задачи и элементы CRM могут не попасть в перечисление, даже у администратора. Скрипт не обходит права доступа.'
@@ -648,6 +688,7 @@ function Export-Report {
     $sb=New-Object Text.StringBuilder
     [void]$sb.Append('<!doctype html><html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Хронология Битрикс24</title><style>body{font:15px system-ui;margin:24px;color:#17212b}h1{font-size:25px}input{padding:10px;width:85%;margin:12px 0}table{border-collapse:collapse;width:100%}th,td{padding:9px;border:1px solid #d8dfe5;text-align:left;vertical-align:top;white-space:pre-wrap;overflow-wrap:anywhere}th{background:#edf2f6;position:sticky;top:0}tr:nth-child(even){background:#f8fafb}details{max-width:650px}.note{padding:12px;background:#fff2d4}.muted{color:#52616f}a{color:#1468ac}</style>')
     [void]$sb.Append("<h1>Хронология сотрудника $EmployeeId</h1><p>$(Html $script:Begin.ToString('o')) — $(Html $script:End.ToString('o')) (правая граница исключена). Часовой пояс: $(Html $TimeZoneId). Строк: $($sorted.Count).</p><p class='note'>Это доступные данные с ограничениями. Полнота всей истории портала не подтверждена. События из разных источников могут описывать одно действие.</p>")
+    [void]$sb.Append("<details open><summary>Почему найдены именно эти события</summary><p>$(Html $diagnosis.Explanation)</p><p>Записей истории прочитано: $($script:HistoryStats.Records); автор не распознан: $($script:HistoryStats.ActorMissing); записей выбранного сотрудника: $($script:HistoryStats.EmployeeRecords); из них в периоде: $($script:HistoryStats.EmployeeInPeriod); вне периода: $($script:HistoryStats.EmployeeOutsidePeriod). Диапазон прочитанных дат UTC: $(Html $script:HistoryStats.MinDate) — $(Html $script:HistoryStats.MaxDate).</p><p>Подробные счётчики: <a href='diagnosis.json'>diagnosis.json</a>. Они относятся к прочитанным историям, а не к числу HTTP-запросов.</p></details>")
     [void]$sb.Append('<details open><summary>Состояние сбора</summary><ul>')
     foreach ($name in $script:Status.Keys) { $s=$script:Status[$name]; [void]$sb.Append("<li>$(Html $name): $(Html $s.Status), строк $($s.Rows), ошибок $($s.Errors). $(Html $s.Limit)</li>") }
     [void]$sb.Append('</ul></details><details><summary>Пробелы и ограничения</summary><ul>')
@@ -835,7 +876,7 @@ try {
             if ('tasks' -in $script:GrantedScopes -and 'task' -notin $script:GrantedScopes) {Write-Warning 'tasks и task — разные коды. Для tasks.task.list нужен именно task.'}
             if ('task' -in $script:GrantedScopes) {
                 # Same first-page request as the collector: validates the method and warms its checkpoint.
-                try {$null=Invoke-Api 'tasks.task.list' ([ordered]@{order=@{ID='ASC'};filter=@{};select=@('ID','TITLE');start=0})}
+                try {$null=Invoke-Api 'tasks.task.list' ([ordered]@{order=@{CHANGED_DATE='DESC';ID='DESC'};filter=@{};select=@('ID','TITLE');start=0})}
                 catch {Note-Error 'Проверка tasks.task.list' $_.Exception.Message}
             }
 

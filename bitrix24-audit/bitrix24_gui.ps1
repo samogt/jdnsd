@@ -265,7 +265,7 @@ Add-Type -AssemblyName PresentationFramework,PresentationCore,WindowsBase,System
 if ([Threading.Thread]::CurrentThread.ApartmentState -ne 'STA') { throw 'Запустите START_GUI.cmd или PowerShell с параметром -STA.' }
 try {
 [xml]$xaml=@'
-<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" Title="Битрикс24 • Отчёт по сотруднику • 1.3.0" Width="1140" Height="880" MinWidth="940" MinHeight="660" WindowStartupLocation="CenterScreen" Background="#F3F5F8" FontFamily="Segoe UI" FontSize="14" Language="ru-RU">
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" Title="Битрикс24 • Отчёт по сотруднику • 1.4.0" Width="1140" Height="880" MinWidth="940" MinHeight="660" WindowStartupLocation="CenterScreen" Background="#F3F5F8" FontFamily="Segoe UI" FontSize="14" Language="ru-RU">
  <Window.Resources>
   <SolidColorBrush x:Key="Muted" Color="#596779"/>
   <Style TargetType="TextBox"><Setter Property="Padding" Value="10,7"/><Setter Property="BorderBrush" Value="#CAD3DF"/><Setter Property="VerticalContentAlignment" Value="Center"/><Setter Property="Background" Value="White"/></Style>
@@ -532,6 +532,8 @@ function Finish-Run {
         $label=if ($script:SelectedEmployeeLabel) {$script:SelectedEmployeeLabel} else {"Сотрудник ID $($summary.EmployeeId)"}
         $Ui.ResultSpec.Text="Сотрудник: $label`nС: $($begin.ToString('dd.MM.yyyy HH:mm:ss'))`nДо: $($end.ToString('dd.MM.yyyy HH:mm:ss')) (не включая)`nЧасовой пояс: $($zone.DisplayName)"
     } else {$Ui.ResultSpec.Text='Отчёт не сформирован. Проверьте подключение и параметры; журнал сохранён в папке, если она была создана.'}
+    $diagnosisPath=Join-Path $script:Job.OutputDir 'diagnosis.json'
+    if([IO.File]::Exists($diagnosisPath)){try{$d=Read-SharedJson $diagnosisPath;$Ui.ResultHelp.Text+=' '+$d.Explanation}catch{}}
     Set-WizardStep 3
     if ($Ui.OpenFolder.IsEnabled) {
         try {[IO.File]::WriteAllText((Join-Path $script:Job.OutputDir 'gui_run.log'),$Ui.Log.Text,(New-Object Text.UTF8Encoding($true)))} catch {Add-UiLog 'Не удалось сохранить журнал окна.'}

@@ -1,4 +1,4 @@
-$ErrorActionPreference='Stop'
+﻿$ErrorActionPreference='Stop'
 . (Join-Path $PSScriptRoot 'bitrix24_employee_audit.ps1') -SelfTest
 # Force a live scope read even though a successful scope checkpoint already exists.
 $SelfTest=$false;$script:ScopeCalls=0
@@ -16,5 +16,5 @@ if($script:TaskBodyEntered -or $script:Status['История задач'].Error
 Run-Source 'CRM-дела' 'test' {Add-Event '2026-10-01T12:00:00+03:00' 'CRM-дела' 'TEST' 'test' '' 'access-regression' '' '2052' ''}
 if($script:Rows.Count -ne 1 -or $script:Status['CRM-дела'].Status -ne 'completed_with_limits'){throw 'Granted source failed to continue'}
 $report=Read-Json ([IO.File]::ReadAllText((Join-Path $OutputDir 'summary.json')))
-if($report.Rows -ne 1 -or $report.AppVersion -ne '1.3.0'){throw 'Incremental report was not exported'}
+if($report.Rows -ne 1 -or $report.AppVersion -ne '1.4.0'){throw 'Incremental report was not exported'}
 Write-Host 'ACCESS TEST PASSED: fresh scope, tasks != task, no request to unavailable task source, other sources continue, incremental report.'
