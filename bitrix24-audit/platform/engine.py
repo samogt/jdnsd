@@ -128,7 +128,11 @@ class PortalClient:
         timer.start()
         try:
             connection.request('POST', path, dump(body).encode(), {'Content-Type': 'application/json; charset=utf-8', 'Accept': 'application/json', 'Accept-Encoding': 'identity'})
-            connection.audit_socket = connection.sock
+            # HTTPResponse may detach/close connection.sock after headers. Keep an independent
+            # control handle to the same TCP connection so shutdown also interrupts body reads
+            # on Windows. The control socket never reads or writes TLS data.
+            wire = connection.sock
+            connection.audit_socket = socket.socket(wire.family, wire.type, wire.proto, fileno=socket.dup(wire.fileno()))
             with self.lock:
                 if key in self.cancelled:
                     return 0, {}, {'error': 'CANCELLED', 'error_description': 'Запрос приостановлен'}
@@ -148,6 +152,9 @@ class PortalClient:
         finally:
             timer.cancel()
             connection.close()
+            control = getattr(connection, 'audit_socket', None)
+            if control:
+                control.close()
             with self.lock:
                 self.connections.pop(key, None)
 

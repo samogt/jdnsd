@@ -122,6 +122,7 @@ class FakeClient(PortalClient):
             if self.mode=='many_all' and int(body['entityId'])!=11:return {'result':[]}
             return {'result': [{'id': 3, 'created': STAMP, 'authorId': 25, 'text': 'Лог приложения'}]}
         if method == 'disk.storage.getList':
+            if self.mode=='batch_missing' and body.get('filter'):return {'result':[]}
             if self.mode in ('many_disk', 'slow_disk', 'many_all'):
                 if body.get('filter'):
                     return {'result': []}
