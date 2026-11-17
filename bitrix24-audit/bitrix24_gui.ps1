@@ -13,7 +13,7 @@ function Read-SharedJson([string]$Path) {
     # Sharing Delete lets the collector replace status.json atomically while the GUI reads it.
     $stream=[IO.File]::Open($Path,[IO.FileMode]::Open,[IO.FileAccess]::Read,([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
     $reader=New-Object IO.StreamReader($stream,[Text.Encoding]::UTF8,$true)
-    try { $reader.ReadToEnd() | ConvertFrom-Json } finally { $reader.Dispose() }
+    try { $parsed=$reader.ReadToEnd() | ConvertFrom-Json;return $parsed } finally { $reader.Dispose() }
 }
 function Get-AuditManifest([string]$Folder) {
     $path=Join-Path $Folder 'manifest.json'
@@ -253,7 +253,7 @@ function Test-GuiCore {
     $peopleFile=Join-Path $dir 'people.json'
     $null=Get-PortalEmployees ($v.Webhook+'profile.json') $peopleFile ''
     $people=@(Read-SharedJson $peopleFile)
-    if ($people.Count -ne 3 -or $script:UserPageCalls -ne 2 -or $people[1].Label -notlike '*уволен*' -or $people[0].Id -ne 7 -or $people[0].Label -like '*уволен*') {throw 'GUI SELFTEST: список сотрудников и его страницы'}
+    if ($people.Count -ne 3 -or $script:UserPageCalls -ne 2 -or $people[1].Label -notlike '*уволен*' -or $people[0].Id -ne 7 -or $people[0].Label -like '*уволен*') {throw ('GUI SELFTEST: список сотрудников и его страницы; count='+$people.Count+' calls='+$script:UserPageCalls+' data='+(ConvertTo-Json -InputObject $people -Compress -Depth 5))}
     Remove-Item -LiteralPath $peopleFile -Force
     Write-Host "GUI SELFTEST PASSED: validation, period, redaction, parameter transport, real child process, 65 synthetic events, cancellation, resume/offline configuration, explicit employee selection, paginated user list. $dir"
 }

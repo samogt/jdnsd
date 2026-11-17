@@ -566,6 +566,12 @@ function Collect-Tasks([string]$Kind) {
                 }
             } catch { Note-Error "task:$id/$Kind" $_.Exception.Message }
         }
+        # Publish useful results while the longer portal scan is still running.
+        if($script:Status.Contains($script:CurrentSource)) {
+            $script:Status[$script:CurrentSource].Rows=@($script:Rows|Where-Object {$_.'Источник' -eq $script:CurrentSource}).Count
+            Save-Json (Join-Path $OutputDir 'status.json') $script:Status
+            Export-Report
+        }
     }
 }
 function Collect-Activities {

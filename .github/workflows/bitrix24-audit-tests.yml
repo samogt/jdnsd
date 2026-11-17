@@ -28,20 +28,27 @@ jobs:
             if($errors.Count){throw ($errors|Out-String)}
           }
       - name: GUI process, parameters, cancellation, employee list
+        if: always()
         run: ./bitrix24_gui.ps1 -SelfTest
       - name: History attribution, period and legacy caches
+        if: always()
         run: ./TEST_HISTORY.ps1
       - name: Scope and incremental results
+        if: always()
         run: ./TEST_ACCESS.ps1
       - name: Rate limits and cooperative cancellation
+        if: always()
         run: ./TEST_RATE_LIMITS.ps1
       - name: Priority and batch collection recovery
+        if: always()
         run: ./TEST_BATCH.ps1
       - name: Actual HTTP error bodies and retry headers
+        if: always()
         run: |
           python ./TEST_HTTP.py --powershell powershell.exe
           if($LASTEXITCODE -ne 0){throw 'HTTP regression failed'}
       - name: Create and render actual WPF window
+        if: always()
         run: |
           & powershell.exe -NoProfile -NonInteractive -STA -ExecutionPolicy Bypass -File ./bitrix24_gui.ps1 -UiSmokeTest -SmokeOutput "$pwd/window.png"
           if($LASTEXITCODE -ne 0){throw 'WPF window smoke test failed'}
