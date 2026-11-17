@@ -1,0 +1,65 @@
+name: Bitrix24 Platform 2 build and checks
+on:
+  push:
+    paths:
+      - 'bitrix24-audit/platform/**'
+      - '.github/workflows/platform-v2-tests.yml'
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  windows-release:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        shell: powershell
+        working-directory: bitrix24-audit/platform
+    steps:
+      - name: Preserve source file bytes
+        working-directory: .
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Contracts, independent source queues, restart, auth and HTTP cancellation
+        run: |
+          python -m unittest -v test_platform.py
+          if($LASTEXITCODE -ne 0){throw 'Platform regression failed'}
+      - name: Build the complete portable Windows application
+        run: |
+          $package=Join-Path $env:RUNNER_TEMP 'Bitrix24 packaged app'
+          python package_app.py --output ../bitrix24_gui.zip --source-commit $env:GITHUB_SHA --extract-to "$package"
+          if($LASTEXITCODE -ne 0){throw 'Portable bundle failed'}
+          & "$package/.runtime/python.exe" -c "import sqlite3,ssl,app,engine,adapters; print('PACKAGED RUNTIME PASSED',sqlite3.sqlite_version)"
+          if($LASTEXITCODE -ne 0){throw 'Bundled runtime failed'}
+      - name: Install browser automation for CI only
+        run: python -m pip install playwright==1.57.0
+      - name: Test the extracted application in real Microsoft Edge
+        run: |
+          $package=Join-Path $env:RUNNER_TEMP 'Bitrix24 packaged app'
+          python smoke_browser.py --app-dir "$package" --runtime "$package/.runtime/python.exe" --artifacts "$env:RUNNER_TEMP/platform-proof"
+          if($LASTEXITCODE -ne 0){throw 'Browser flow failed'}
+      - name: Retain browser evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: platform-windows-proof
+          path: ${{ runner.temp }}/platform-proof/*.png
+          if-no-files-found: ignore
+      - name: Verify the ZIP payload and publish the tested archive
+        run: |
+          python -c "import zipfile,json,hashlib; z=zipfile.ZipFile('../bitrix24_gui.zip'); m=json.loads(z.read('build_manifest.json')); assert all(hashlib.sha256(z.read(k)).hexdigest()==v for k,v in m['files'].items()); assert m['source_commit']==__import__('os').environ['GITHUB_SHA']; print('ARCHIVE VERIFIED')"
+          if($LASTEXITCODE -ne 0){throw 'Archive verification failed'}
+          Copy-Item README.md ../README.md -Force
+          git fetch origin main
+          $head=git rev-parse origin/main
+          if($head.Trim() -ne $env:GITHUB_SHA){throw 'Branch advanced; archive not published over newer work'}
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- ../bitrix24_gui.zip ../README.md
+          git commit -m 'Publish tested self-contained Bitrix24 Platform 2.0.0 Windows bundle'
+          if($LASTEXITCODE -ne 0){throw 'Release commit failed'}
+          git push origin HEAD:main
+          if($LASTEXITCODE -ne 0){throw 'Release push failed'}
