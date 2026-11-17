@@ -53,8 +53,8 @@ try:
         page.locator('#employee-list').select_option('25')
         expect(page.locator('#employee')).to_have_value('25')
         page.screenshot(path=str(artifacts/'setup.png'),full_page=True)
-        page.locator('#from').fill('2026-09-17T09:30:00')
-        page.locator('#to').fill('2026-11-17T09:30:00')
+        page.locator('#from').fill('2026-09-17T09:30')
+        page.locator('#to').fill('2026-11-17T09:30')
         page.locator('#create').click()
         expect(page.locator('#journey')).to_be_visible(timeout=15000)
         expect(page.locator('#event-count')).not_to_have_text('0',timeout=30000)
@@ -102,7 +102,13 @@ try:
     print('WINDOWS BROWSER PASSED: extracted portable bundle; no default employee; webhook check; paginated users; all eight peers finish while large disk queue remains; partial report; CSV; single API request; app restart and resume without persisted webhook; no JavaScript errors.')
 finally:
     if process and process.poll() is None:
-        process.terminate()
-        try:process.wait(timeout=10)
-        except subprocess.TimeoutExpired:process.kill()
+        try:
+            request=urllib.request.Request(state['origin']+'/api/shutdown',data=b'{}',headers={'Authorization':'Bearer '+state['token'],'Content-Type':'application/json'})
+            urllib.request.urlopen(request,timeout=3).close()
+            process.wait(timeout=10)
+        except Exception:
+            if os.name=='nt':subprocess.run(['taskkill','/PID',str(process.pid),'/T','/F'],capture_output=True)
+            else:process.terminate()
+            try:process.wait(timeout=5)
+            except subprocess.TimeoutExpired:process.kill()
     temporary.cleanup()

@@ -33,6 +33,8 @@ class FakeClient(PortalClient):
     def call(self, method, body, version=2, key=None):
         with self.trace_lock:
             self.calls.append((method, copy.deepcopy(body)))
+        if self.mode=='batch_missing' and method=='batch':
+            return 200, {}, {'error':'ERROR_METHOD_NOT_FOUND','error_description':'Batch unavailable'}
         if self.mode == 'slow_disk' and method.startswith('disk.'):
             time.sleep(.4)
         if self.mode in ('rate','global_rate') and method == 'main.eventlog.list':

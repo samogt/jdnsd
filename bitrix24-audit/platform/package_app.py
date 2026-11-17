@@ -19,6 +19,8 @@ with tempfile.TemporaryDirectory(prefix='bitrix-package-') as temporary:
     temporary=Path(temporary);runtime_zip=temporary/'python.zip'
     urllib.request.urlretrieve(url,runtime_zip)
     runtime_hash=hashlib.sha256(runtime_zip.read_bytes()).hexdigest()
+    if runtime_hash!='90905e64a840557d8c1bc4f5b74db3d7ee85e3ffb217611cac1c7813acea4159':
+        raise RuntimeError('Official runtime checksum differs from the verified distribution')
     package=temporary/'package';(package/'.runtime').mkdir(parents=True)
     with zipfile.ZipFile(runtime_zip) as archive:
         if archive.testzip():raise RuntimeError('Invalid runtime ZIP')

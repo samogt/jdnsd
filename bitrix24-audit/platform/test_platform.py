@@ -161,6 +161,14 @@ class PlatformTests(unittest.TestCase):
         self.assertTrue(any(m == 'batch' for m,b in FakeClient.calls))
         self.assertTrue(any(s['failed'] for s in state['sources']))
 
+    def test_batch_unavailable_http_200_falls_back_to_direct_methods(self):
+        FakeClient.mode='batch_missing'
+        job=self.create(['disk'])
+        state=drain(self.engine,job)
+        self.assertEqual('done',state['state'])
+        self.assertTrue(any(m=='batch' for m,b in FakeClient.calls))
+        self.assertTrue(any(m=='disk.storage.getChildren' for m,b in FakeClient.calls))
+
     def test_positional_batch_encoding_and_secret_redaction(self):
         body=[42,{'ID':'ASC'},{'USER_ID':25},['ID','SECONDS'],{'NAV_PARAMS':{'nPageSize':50,'iNumPage':2}}]
         value=unflatten(urllib.parse.urlencode(query_encode(body)))

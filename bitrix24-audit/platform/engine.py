@@ -456,7 +456,7 @@ class Engine:
                             else:
                                 error = result.get('result_error', {}).get(key, {'error': 'MISSING_BATCH_RESULT', 'error_description': 'В пакете нет ответа команды'})
                                 self._finish(c, item, 200, headers, error, handle)
-                    elif status in (400, 404) and not re.search('LIMIT|RATELIMIT', code, re.I):
+                    elif (status in (400, 404) or code.lower() in ('method_not_found', 'error_method_not_found', 'insufficient_scope')) and not re.search('LIMIT|RATELIMIT', code, re.I):
                         c.execute('INSERT OR REPLACE INTO methods VALUES(?,?,0,?)', (bundle[0]['job'], 'batch', 'Пакетный метод недоступен'))
                         for item in bundle:
                             c.execute("UPDATE work SET state='queued',lease='',attempt=MAX(0,attempt-1) WHERE id=? AND lease=?", (item['id'], item['lease']))
