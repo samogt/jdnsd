@@ -1,6 +1,6 @@
 ﻿#requires -Version 5.1
 [CmdletBinding()]
-param([switch]$SelfTest,[string]$EmployeeListFile,[string]$CancelFile)
+param([switch]$SelfTest,[string]$EmployeeListFile,[string]$CancelFile,[switch]$UiSmokeTest,[string]$SmokeOutput)
 $ErrorActionPreference='Stop'
 . (Join-Path $PSScriptRoot 'bitrix24_http.ps1')
 $script:AppRoot=$PSScriptRoot
@@ -153,9 +153,9 @@ function Start-AuditProcess($Job,[string]$PowerShellPath) {
     $collector=Join-Path $script:AppRoot $entry
     if (-not [IO.File]::Exists($collector)) { throw 'Рядом с интерфейсом не найден bitrix24_employee_audit.ps1. Распакуйте весь архив.' }
     $bootstrap=@'
+$ProgressPreference='SilentlyContinue'
 $ErrorActionPreference='Stop'
 [Console]::OutputEncoding=New-Object Text.UTF8Encoding($false)
-$ProgressPreference='SilentlyContinue'
 try {
     $jobParameters=[Management.Automation.PSSerializer]::Deserialize($env:BITRIX_AUDIT_PARAMETERS)
     & $env:BITRIX_AUDIT_SCRIPT @jobParameters *>&1 | ForEach-Object { [Console]::WriteLine([string]$_) }
@@ -170,7 +170,7 @@ try {
 '@
     $info=New-Object Diagnostics.ProcessStartInfo
     $info.FileName=$PowerShellPath
-    $info.Arguments='-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand '+[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($bootstrap))
+    $info.Arguments='-NoLogo -NoProfile -NonInteractive -InputFormat Text -OutputFormat Text -ExecutionPolicy Bypass -EncodedCommand '+[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($bootstrap))
     $info.UseShellExecute=$false;$info.CreateNoWindow=$true
     $info.RedirectStandardOutput=$true;$info.RedirectStandardError=$true
     $info.StandardOutputEncoding=New-Object Text.UTF8Encoding($false)
@@ -265,7 +265,7 @@ Add-Type -AssemblyName PresentationFramework,PresentationCore,WindowsBase,System
 if ([Threading.Thread]::CurrentThread.ApartmentState -ne 'STA') { throw 'Запустите START_GUI.cmd или PowerShell с параметром -STA.' }
 try {
 [xml]$xaml=@'
-<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" Title="Битрикс24 • Отчёт по сотруднику • 1.4.0" Width="1140" Height="880" MinWidth="940" MinHeight="660" WindowStartupLocation="CenterScreen" Background="#F3F5F8" FontFamily="Segoe UI" FontSize="14" Language="ru-RU">
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" Title="Битрикс24 • Отчёт по сотруднику • 1.5.0" Width="1140" Height="880" MinWidth="940" MinHeight="660" WindowStartupLocation="CenterScreen" Background="#F3F5F8" FontFamily="Segoe UI" FontSize="14" Language="ru-RU">
  <Window.Resources>
   <SolidColorBrush x:Key="Muted" Color="#596779"/>
   <Style TargetType="TextBox"><Setter Property="Padding" Value="10,7"/><Setter Property="BorderBrush" Value="#CAD3DF"/><Setter Property="VerticalContentAlignment" Value="Center"/><Setter Property="Background" Value="White"/></Style>
@@ -618,8 +618,21 @@ $script:Window.Add_Closing({param($sender,$eventArgs)
     if ($script:Process) {$eventArgs.Cancel=$true;$script:CloseWhenDone=$true;try {Request-Stop} catch {Show-UiError $_.Exception.Message}}
 })
 Set-TwoMonths;Update-Mode;Set-WizardStep 1
-[void]$script:Window.ShowDialog()
+if($UiSmokeTest) {
+    if($Ui.Employee.Text -or $Ui.Employee.SelectedItem){throw 'Employee must not be preselected'}
+    $script:Window.Show();$script:Window.UpdateLayout()
+    if($script:Window.ActualWidth -lt 900 -or $script:Window.ActualHeight -lt 600){throw 'Window layout did not initialize'}
+    if($SmokeOutput) {
+        $bitmap=New-Object Windows.Media.Imaging.RenderTargetBitmap ([int]$script:Window.ActualWidth),([int]$script:Window.ActualHeight),96,96,([Windows.Media.PixelFormats]::Pbgra32)
+        $bitmap.Render($script:Window)
+        $encoder=New-Object Windows.Media.Imaging.PngBitmapEncoder
+        $encoder.Frames.Add([Windows.Media.Imaging.BitmapFrame]::Create($bitmap))
+        $stream=[IO.File]::Create($SmokeOutput);try{$encoder.Save($stream)}finally{$stream.Dispose()}
+    }
+    $script:Window.Close();Write-Host 'WPF SMOKE TEST PASSED: real window, layout, empty employee choice.'
+} else {[void]$script:Window.ShowDialog()}
 $script:Timer.Stop()
 } catch {
+    if($UiSmokeTest){throw}
     [void][Windows.MessageBox]::Show((Hide-AuditSecret $_.Exception.Message),'Ошибка запуска интерфейса',[Windows.MessageBoxButton]::OK,[Windows.MessageBoxImage]::Error)
 }

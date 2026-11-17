@@ -38,7 +38,7 @@ $script:LastRef = ''
 $script:NetworkCalls = 0
 $script:CachedCalls = 0
 $script:IncompleteRun = $true
-$script:AppVersion='1.4.0'
+$script:AppVersion='1.5.0'
 $script:EventUserOnlyDone=$false
 $script:HistoryStats=[ordered]@{Records=0;ActorMissing=0;EmployeeRecords=0;EmployeeInPeriod=0;EmployeeOutsidePeriod=0;InvalidDates=0;MinDate='';MaxDate='';Actors=@{}}
 $script:HistorySeen=@{}
@@ -451,9 +451,82 @@ function Read-EventWindow([DateTimeOffset]$Left,[DateTimeOffset]$Right,[switch]$
         } else { Note-Error "$($Left.ToString('yyyy-MM-ddTHH:mm:sszzz')) .. $($Right.ToString('yyyy-MM-ddTHH:mm:sszzz'))" $_.Exception.Message }
     }
 }
+function Get-TaskPages {
+    # Priorities improve time to first useful result; the final unfiltered scan preserves coverage.
+    $seen=@{}
+    foreach ($role in @('CREATED_BY','RESPONSIBLE_ID','STATUS_CHANGED_BY','ACCOMPLICE','AUDITOR','ALL')) {
+        $filter=@{};if($role -ne 'ALL'){$filter[$role]=$EmployeeId}
+        $payload=[ordered]@{order=@{CHANGED_DATE='DESC';ID='DESC'};filter=$filter;select=@('ID','TITLE')}
+        if($RebuildOnly -and $role -ne 'ALL') {
+            $first=[ordered]@{};foreach($k in $payload.Keys){$first[$k]=$payload[$k]};$first.start=0
+            $b=Json(Canonical $first)
+            if(-not [IO.File]::Exists((Join-Path $OutputDir "raw/tasks.task.list-$(Hash "2|tasks.task.list|$b").json"))){continue}
+        }
+        Write-Host "[Задачи] Приоритет=$role; уже найдено уникальных задач: $($seen.Count)"
+        try {
+            Get-Pages 'tasks.task.list' $payload 'tasks' | ForEach-Object {
+                $unique=New-Object 'System.Collections.Generic.List[object]'
+                foreach($task in $_.Items) {
+                    $id=[string]$task.id
+                    if(-not $id){throw 'Список задач: пустой id'}
+                    if(-not $seen.ContainsKey($id)){$seen[$id]=$true;$unique.Add($task)}
+                }
+                if($unique.Count){[pscustomobject]@{Items=@($unique.ToArray());Raw=$_.Raw}}
+            }
+        } catch {
+            if($role -eq 'ALL' -or $_.Exception.Message -match 'AUDIT_CANCELLED|HTTP=(401|403|429)\b|METHOD_DEFERRED|insufficient_scope'){throw}
+            # Some portal versions reject an optional role filter. Never let that prevent the full scan.
+            Write-Warning "Приоритет $role недоступен: $(Protect-Text $_.Exception.Message). Продолжаем обход остальных задач."
+        }
+    }
+}
+function Save-HistoryBatch([object[]]$Tasks) {
+    if($RebuildOnly -or $script:BatchUnavailable){return}
+    $missing=New-Object 'System.Collections.Generic.List[object]'
+    foreach($task in $Tasks) {
+        $payload=[ordered]@{taskId=[int]$task.id;order=@{createdDate='ASC'}}
+        $body=Json(Canonical $payload)
+        $path=Join-Path $OutputDir "raw/tasks.task.history.list-$(Hash "2|tasks.task.history.list|$body").json"
+        $payload.start=0;$legacyBody=Json(Canonical $payload)
+        $legacy=Join-Path $OutputDir "raw/tasks.task.history.list-$(Hash "2|tasks.task.history.list|$legacyBody").json"
+        if(-not [IO.File]::Exists($path) -and -not [IO.File]::Exists($legacy)) {
+            $missing.Add([pscustomobject]@{Id=[int]$task.id;Body=$body;Path=$path})
+        }
+    }
+    for($offset=0;$offset -lt $missing.Count;$offset+=25) {
+        Assert-Collecting
+        $cmd=[ordered]@{};$entries=@($missing | Select-Object -Skip $offset -First 25)
+        foreach($e in $entries){$cmd["h$($e.Id)"]="tasks.task.history.list?taskId=$($e.Id)&order%5BcreatedDate%5D=ASC"}
+        try {
+            $batch=Invoke-Api 'batch' ([ordered]@{halt=0;cmd=$cmd})
+            if(-not (Has $batch.result 'result')){throw 'batch: отсутствует result.result'}
+            $batchRef=$script:LastRef
+            foreach($e in $entries) {
+                $key="h$($e.Id)"
+                if(Has $batch.result.result $key) {
+                    $response=[ordered]@{result=(Value $batch.result.result $key)}
+                    if(Has $batch.result.result_next $key){$response.next=Value $batch.result.result_next $key}
+                    if(Has $batch.result.result_total $key){$response.total=Value $batch.result.result_total $key}
+                    try {
+                        Validate-Response 'tasks.task.history.list' $response
+                        Save-Json $e.Path ([ordered]@{Request=@{Method='tasks.task.history.list';Version=2;Body=$e.Body};FetchedAt=[DateTimeOffset]::UtcNow.ToString('o');BatchSource=$batchRef;Response=$response})
+                    } catch {Write-Warning "История задачи $($e.Id): ответ пакета не сохранён; проверим отдельным запросом."}
+                }
+                # Failed/missing child results are deliberately left uncached and retried individually below.
+            }
+        } catch {
+            if($_.Exception.Message -match 'AUDIT_CANCELLED|HTTP=429\b|METHOD_DEFERRED'){throw}
+            $script:BatchUnavailable=$true
+            Write-Warning "Пакетное чтение недоступно: $(Protect-Text $_.Exception.Message). Продолжаем отдельными запросами."
+            return
+        }
+    }
+}
 function Collect-Tasks([string]$Kind) {
-    Get-Pages 'tasks.task.list' ([ordered]@{order=@{CHANGED_DATE='DESC';ID='DESC'};filter=@{};select=@('ID','TITLE')}) 'tasks' | ForEach-Object {
-        foreach ($task in $_.Items) {
+    Get-TaskPages | ForEach-Object {
+        $tasks=@($_.Items)
+        if ($Kind -eq 'history') { Save-HistoryBatch $tasks }
+        foreach ($task in $tasks) {
             $id=[string]$task.id; $label="Задача #$id — $($task.title)"
             if (-not $id) { throw 'Список задач: пустой id' }
             try {
@@ -747,6 +820,15 @@ function Install-TestTransport {
             'tasks.task.list' {
                 if ($b.start -eq 0) { return [pscustomobject]@{result=@{tasks=@(@{id=10;title='Чужая задача'})};next=50;total=2} }
                 return [pscustomobject]@{result=@{tasks=@(@{id=20;title='Вторая задача'})};total=2}
+            }
+            'batch' {
+                $results=[ordered]@{}
+                foreach($property in $b.cmd.PSObject.Properties) {
+                    if($property.Value -notmatch '^tasks\.task\.history\.list\?taskId=(\d+)&'){throw 'Unexpected batch command'}
+                    $list=@();if([int]$Matches[1] -eq 10){$list=@(1..50|ForEach-Object {@{id=$_;createdDate=$ts;field='DEADLINE';user=@{id=2052;name='Автор'};value=@{from='a';to='b'}}})}
+                    $results[$property.Name]=@{list=$list}
+                }
+                return [pscustomobject]@{result=@{result=$results;result_error=@{};result_next=@{};result_total=@{}}}
             }
             'tasks.task.history.list' {
                 if ($b.taskId -eq 20 -or $b.start -gt 0) { return [pscustomobject]@{result=@{list=$empty}} }

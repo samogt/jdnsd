@@ -1,4 +1,4 @@
-$ErrorActionPreference='Stop'
+﻿$ErrorActionPreference='Stop'
 . (Join-Path $PSScriptRoot 'bitrix24_employee_audit.ps1') -SelfTest
 $script:HistoryStats=[ordered]@{Records=0;ActorMissing=0;EmployeeRecords=0;EmployeeInPeriod=0;EmployeeOutsidePeriod=0;InvalidDates=0;MinDate='';MaxDate='';Actors=@{}}
 $script:HistorySeen=@{};$script:HistoryRequests=0
