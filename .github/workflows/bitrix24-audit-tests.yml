@@ -55,6 +55,12 @@ jobs:
       - name: Priority and batch collection recovery
         if: always()
         run: ./TEST_BATCH.ps1
+      - name: Large portal source scheduling and partial results
+        if: always()
+        run: ./TEST_LARGE_PORTAL.ps1
+      - name: Source skip controls and live waiting indicator
+        if: always()
+        run: ./TEST_CONTROLS.ps1
       - name: Actual HTTP error bodies and retry headers
         if: always()
         run: |

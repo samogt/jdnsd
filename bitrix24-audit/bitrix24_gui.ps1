@@ -61,10 +61,11 @@ function Get-PortalEmployees([string]$Webhook,[string]$Destination,[string]$Stop
             $http=0;$code='';$description=''
             $body=@{select=@('ID','NAME','LAST_NAME','SECOND_NAME','ACTIVE');filter=@{USER_TYPE='employee'};ADMIN_MODE=$true;sort='ID';order='ASC';start=$position}|ConvertTo-Json -Compress
             try {
-                $response=Invoke-AuditHttp -UseBasicParsing -Method Post -Uri ($hook.BaseUrl+'/user.get') -ContentType 'application/json; charset=utf-8' -Body ([Text.Encoding]::UTF8.GetBytes($body)) -TimeoutSec 90 -MaximumRedirection 0 -ErrorAction Stop
+                $response=Invoke-AuditHttp -UseBasicParsing -Method Post -Uri ($hook.BaseUrl+'/user.get') -ContentType 'application/json; charset=utf-8' -Body ([Text.Encoding]::UTF8.GetBytes($body)) -TimeoutSec 90 -MaximumRedirection 0 -ErrorAction Stop -CancellationCheck {if($StopFile -and [IO.File]::Exists($StopFile)){throw 'AUDIT_CANCELLED: загрузка сотрудников остановлена'}}
                 $http=if($response.StatusCode){[int]$response.StatusCode}else{200}
                 try {$data=$response.Content|ConvertFrom-Json} catch {$description='Сервер вернул не JSON: '+(Hide-AuditSecret $response.Content)}
             } catch {
+                if($_.Exception.Message -match 'AUDIT_CANCELLED'){throw}
                 if ($_.Exception.Response) {try {$http=[int]$_.Exception.Response.StatusCode} catch {}}
                 if ($_.ErrorDetails.Message) {try {$data=$_.ErrorDetails.Message|ConvertFrom-Json} catch {}}
             }
@@ -117,7 +118,8 @@ function New-AuditJob([hashtable]$Values) {
     $folder=[IO.Path]::GetFullPath($Values.Folder.Trim())
     if (-not [IO.Directory]::Exists($folder)) { throw 'Папка не существует. Выберите существующую папку или создайте её через кнопку «Выбрать».' }
     $cancel=Join-Path ([IO.Path]::GetTempPath()) ('bitrix-audit-stop-'+[guid]::NewGuid().ToString('N')+'.flag')
-    $parameters=@{CancelFile=$cancel}
+    $skip=$cancel+'.source'
+    $parameters=@{CancelFile=$cancel;SkipSourceFile=$skip}
     $webhook=''
     if ($mode -ne 'Offline') {
         if ([string]::IsNullOrWhiteSpace($Values.Webhook)) { throw 'Заполните поле «Входящий вебхук».' }
@@ -146,7 +148,26 @@ function New-AuditJob([hashtable]$Values) {
         $parameters.MaxAttempts=Get-Number $Values.MaxAttempts 'Число попыток' 1 8
     }
     $parameters.OutputDir=$folder
-    [pscustomobject]@{Parameters=$parameters;OutputDir=$folder;CancelFile=$cancel;Webhook=$webhook;Mode=$mode}
+    [pscustomobject]@{Parameters=$parameters;OutputDir=$folder;CancelFile=$cancel;SkipSourceFile=$skip;Webhook=$webhook;Mode=$mode}
+}
+function Write-SourceSkipRequest($Job,[string]$DisplayedStageId) {
+    $state=Read-SharedJson (Join-Path $Job.OutputDir 'run_state.json')
+    if(-not $DisplayedStageId -or $state.StageId -cne $DisplayedStageId -or $state.State -ne 'running' -or $state.Source -eq 'Проверка доступа'){return $false}
+    [IO.File]::WriteAllText($Job.SkipSourceFile,$DisplayedStageId)
+    return $true
+}
+function Get-AuditProgressText($State,[DateTimeOffset]$Now=[DateTimeOffset]::UtcNow) {
+    $elapsed=[Math]::Max(0,[int]($Now-[DateTimeOffset]$State.SourceStartedAt).TotalSeconds)
+    $text="$($State.Source) · выполняется $elapsed сек."
+    if($State.Source -eq 'Задачи') {
+        $total=if($null -ne $State.TasksTotal){[string]$State.TasksTotal}else{'уточняется'}
+        $text+=" $($State.TaskPhase). Проверено задач: $($State.TasksProcessed); всего доступно: $total. Записей истории: $($State.HistoryRecords); автор сотрудника: $($State.EmployeeHistoryRecords)."
+    }
+    if($State.WaitingForApi -and $State.RequestStartedAt) {
+        $wait=[Math]::Max(0,[int]($Now-[DateTimeOffset]$State.RequestStartedAt).TotalSeconds)
+        $text+=" Ожидаем ответ $($State.Method): $wait сек. Таймаут запроса: 90 сек; остановка и пропуск доступны."
+    }
+    return $text
 }
 function Start-AuditProcess($Job,[string]$PowerShellPath) {
     $entry=if ($Job.Mode -eq 'Users') {'bitrix24_gui.ps1'} else {'bitrix24_employee_audit.ps1'}
@@ -265,7 +286,7 @@ Add-Type -AssemblyName PresentationFramework,PresentationCore,WindowsBase,System
 if ([Threading.Thread]::CurrentThread.ApartmentState -ne 'STA') { throw 'Запустите START_GUI.cmd или PowerShell с параметром -STA.' }
 try {
 [xml]$xaml=@'
-<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" Title="Битрикс24 • Отчёт по сотруднику • 1.5.0" Width="1140" Height="880" MinWidth="940" MinHeight="660" WindowStartupLocation="CenterScreen" Background="#F3F5F8" FontFamily="Segoe UI" FontSize="14" Language="ru-RU">
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" Title="Битрикс24 • Отчёт по сотруднику • 1.6.0" Width="1140" Height="880" MinWidth="940" MinHeight="660" WindowStartupLocation="CenterScreen" Background="#F3F5F8" FontFamily="Segoe UI" FontSize="14" Language="ru-RU">
  <Window.Resources>
   <SolidColorBrush x:Key="Muted" Color="#596779"/>
   <Style TargetType="TextBox"><Setter Property="Padding" Value="10,7"/><Setter Property="BorderBrush" Value="#CAD3DF"/><Setter Property="VerticalContentAlignment" Value="Center"/><Setter Property="Background" Value="White"/></Style>
@@ -332,9 +353,9 @@ try {
    <Grid x:Name="RunView" Visibility="Collapsed">
     <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
     <Border Background="White" BorderBrush="#DFE5ED" BorderThickness="1" CornerRadius="10" Padding="24" Margin="0,0,0,14"><StackPanel><TextBlock x:Name="State" Text="Формируем отчёт" FontSize="24" FontWeight="SemiBold"/><TextBlock x:Name="StateHelp" TextWrapping="Wrap" Foreground="{StaticResource Muted}" Margin="0,7,0,14"/><ProgressBar x:Name="Progress" Height="6" Foreground="#2072D6"/><Grid Margin="0,16,0,0"><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="*"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions><StackPanel><TextBlock Text="СОБЫТИЙ В ИТОГЕ" FontSize="11" Foreground="{StaticResource Muted}"/><TextBlock x:Name="EventCount" Text="—" FontSize="26" FontWeight="SemiBold"/></StackPanel><StackPanel Grid.Column="1"><TextBlock Text="ИСТОЧНИКОВ ОБРАБОТАНО" FontSize="11" Foreground="{StaticResource Muted}"/><TextBlock x:Name="SourceCount" Text="0" FontSize="26" FontWeight="SemiBold"/></StackPanel><StackPanel Grid.Column="2"><TextBlock Text="ОШИБОК" FontSize="11" Foreground="{StaticResource Muted}"/><TextBlock x:Name="ErrorCount" Text="0" FontSize="26" FontWeight="SemiBold"/></StackPanel></Grid></StackPanel></Border>
-    <Border Grid.Row="1" Background="White" BorderBrush="#DFE5ED" BorderThickness="1" CornerRadius="10" Padding="16"><Grid><Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions><TextBlock Text="Проверяем источники событий" FontWeight="SemiBold" Margin="0,0,0,12"/><DataGrid x:Name="Sources" Grid.Row="1" AutoGenerateColumns="False" IsReadOnly="True" CanUserAddRows="False" CanUserDeleteRows="False" HeadersVisibility="Column" GridLinesVisibility="Horizontal" BorderThickness="0" Background="White" AlternatingRowBackground="#F6F8FB" SelectionMode="Single"><DataGrid.Columns><DataGridTextColumn Header="Источник" Binding="{Binding Name}" Width="*"/><DataGridTextColumn Header="Состояние" Binding="{Binding State}" Width="210"/><DataGridTextColumn Header="Строк" Binding="{Binding Rows}" Width="70"/><DataGridTextColumn Header="Ошибок" Binding="{Binding Errors}" Width="80"/></DataGrid.Columns></DataGrid></Grid></Border>
+    <Border Grid.Row="1" Background="White" BorderBrush="#DFE5ED" BorderThickness="1" CornerRadius="10" Padding="16"><Grid><Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions><DockPanel Margin="0,0,0,12"><Button x:Name="OpenCurrentReport" DockPanel.Dock="Right" Content="Открыть текущий отчёт" IsEnabled="False"/><TextBlock Text="Проверяем источники событий" FontWeight="SemiBold" VerticalAlignment="Center"/></DockPanel><DataGrid x:Name="Sources" Grid.Row="1" AutoGenerateColumns="False" IsReadOnly="True" CanUserAddRows="False" CanUserDeleteRows="False" HeadersVisibility="Column" GridLinesVisibility="Horizontal" BorderThickness="0" Background="White" AlternatingRowBackground="#F6F8FB" SelectionMode="Single"><DataGrid.Columns><DataGridTextColumn Header="Источник" Binding="{Binding Name}" Width="*"/><DataGridTextColumn Header="Состояние" Binding="{Binding State}" Width="210"/><DataGridTextColumn Header="Строк" Binding="{Binding Rows}" Width="70"/><DataGridTextColumn Header="Ошибок" Binding="{Binding Errors}" Width="80"/></DataGrid.Columns></DataGrid></Grid></Border>
     <Expander Grid.Row="2" Header="Показать журнал выполнения" Margin="0,12,0,0"><TextBox x:Name="Log" Height="150" Background="#17283E" Foreground="#E3ECF6" BorderThickness="0" IsReadOnly="True" FontFamily="Consolas" FontSize="11" TextWrapping="Wrap" VerticalScrollBarVisibility="Auto" AcceptsReturn="True"/></Expander>
-    <Grid Grid.Row="3" Margin="0,14,0,0"><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions><TextBlock Text="Обработка идёт по доступным данным. Окно можно оставить открытым.&#10;При остановке сохранится частичный отчёт." FontSize="12" Foreground="{StaticResource Muted}"/><Button x:Name="Stop" Grid.Column="1" Content="Остановить и сохранить" IsEnabled="False"/></Grid>
+    <Grid Grid.Row="3" Margin="0,14,0,0"><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions><TextBlock Text="Обработка идёт по доступным данным. Окно можно оставить открытым.&#10;При остановке сохранится частичный отчёт." FontSize="12" Foreground="{StaticResource Muted}"/><StackPanel Grid.Column="1" Orientation="Horizontal"><Button x:Name="SkipSource" Content="Пропустить этот источник" IsEnabled="False" Margin="0,0,10,0"/><Button x:Name="Stop" Content="Остановить и сохранить" IsEnabled="False"/></StackPanel></Grid>
    </Grid>
    <Grid x:Name="ResultView" Visibility="Collapsed">
     <Border Background="White" BorderBrush="#DFE5ED" BorderThickness="1" CornerRadius="10" Padding="32"><ScrollViewer VerticalScrollBarVisibility="Auto"><StackPanel>
@@ -362,10 +383,10 @@ $script:Window.Width=[Math]::Min(1220,[System.Windows.SystemParameters]::WorkAre
 $script:Window.Height=[Math]::Min(900,[System.Windows.SystemParameters]::WorkArea.Height-24)
 $script:Ui=@{}
 # Explicit names make missing controls fail during startup rather than in a click handler.
-$names='Help Step1 Step2 Step3 SetupView Mode ModeHelp Webhook VisibleWebhook ShowWebhook Employee LoadUsers EmployeeHelp TwoMonths FromDate FromTime ToDate ToTime TimeZone FolderLabel Folder Browse FolderHelp InputTimeZone WorkdayHours Pause Attempts Start RunView State StateHelp Progress EventCount SourceCount ErrorCount Sources Log Stop ResultView ResultTitle ResultHelp ResultSpec ResultRows ResultErrors OpenReport OpenExcel OpenFolder ResultPath ResultLog Back'
+$names='Help Step1 Step2 Step3 SetupView Mode ModeHelp Webhook VisibleWebhook ShowWebhook Employee LoadUsers EmployeeHelp TwoMonths FromDate FromTime ToDate ToTime TimeZone FolderLabel Folder Browse FolderHelp InputTimeZone WorkdayHours Pause Attempts Start RunView State StateHelp Progress EventCount SourceCount ErrorCount Sources OpenCurrentReport Log SkipSource Stop ResultView ResultTitle ResultHelp ResultSpec ResultRows ResultErrors OpenReport OpenExcel OpenFolder ResultPath ResultLog Back'
 foreach ($name in $names.Split(' ')) { $script:Ui[$name]=$script:Window.FindName($name);if ($null -eq $script:Ui[$name]) {throw "Не найден элемент интерфейса: $name"} }
 $script:Process=$null;$script:Job=$null;$script:OutTask=$null;$script:ErrTask=$null
-$script:CancelRequested=$false;$script:CloseWhenDone=$false;$script:LastStatus='';$script:RunStarted=$null
+$script:CancelRequested=$false;$script:CloseWhenDone=$false;$script:LastStatus='';$script:RunStarted=$null;$script:DisplayedStageId='';$script:SkipRequestedStage='';$script:LastRunUpdate=[DateTime]::MinValue
 $script:PreviousMode='';$script:SelectionHookKey='';$script:SelectedEmployeeLabel=''
 $script:PowerShellExe=Join-Path ([Environment]::GetFolderPath('System')) 'WindowsPowerShell\v1.0\powershell.exe'
 $script:Timer=New-Object Windows.Threading.DispatcherTimer
@@ -456,7 +477,7 @@ function Update-Mode {
 function Set-Running([bool]$Running) {
     foreach ($n in @('Mode','Folder','Browse','Start','Webhook','VisibleWebhook','ShowWebhook','Employee','FromDate','FromTime','ToDate','ToTime','TimeZone','InputTimeZone','WorkdayHours','Pause','Attempts','TwoMonths')) {$Ui[$n].IsEnabled=-not $Running}
     $Ui.LoadUsers.IsEnabled=($Running -and $script:Job.Mode -eq 'Users') -or (-not $Running -and (Get-Mode) -eq 'New')
-    $Ui.Stop.IsEnabled=$Running;$Ui.Progress.IsIndeterminate=$Running
+    $Ui.Stop.IsEnabled=$Running;$Ui.SkipSource.IsEnabled=$false;$Ui.Progress.IsIndeterminate=$Running
     if (-not $Running) {Update-Mode}
 }
 function Read-ProcessLines([string]$Stream) {
@@ -483,21 +504,48 @@ function Update-SourceGrid {
         $data=Read-SharedJson $path;$script:LastStatus=$stamp
         $rows=@();$done=0;$errors=0
         foreach ($p in $data.PSObject.Properties) {
-            $state=switch ($p.Value.Status) {running {'Выполняется'} completed_with_limits {'Завершён с ограничениями'} partial {'Частично'} failed_or_unavailable {'Недоступен / ошибка'} deferred {'Отложен: лимит API'} interrupted {'Остановлен'} default {[string]$p.Value.Status}}
-            if ($p.Value.Status -in @('completed_with_limits','partial','failed_or_unavailable')) {$done++}
+            $state=switch ($p.Value.Status) {running {'Выполняется'} completed_with_limits {'Завершён с ограничениями'} partial {'Частично'} failed_or_unavailable {'Недоступен / ошибка'} deferred {'Отложен: лимит API'} skipped {'Пропущен: неполные данные'} interrupted {'Остановлен'} default {[string]$p.Value.Status}}
+            if ($p.Value.Status -in @('completed_with_limits','partial','failed_or_unavailable','skipped')) {$done++}
             $rows+=[pscustomobject]@{Name=$p.Name;State=$state;Rows=$p.Value.Rows;Errors=$p.Value.Errors}
             $errors+=[int]$p.Value.Errors
         }
         $Ui.Sources.ItemsSource=$rows;$Ui.SourceCount.Text=[string]$done;$Ui.ErrorCount.Text=[string]$errors
     } catch { } # A concurrent rename or incomplete external file is retried on the next timer tick.
 }
+function Update-RunProgress {
+    if(-not $script:Job -or $script:Job.Mode -eq 'Users' -or $script:CancelRequested){return}
+    if(((Get-Date)-$script:LastRunUpdate).TotalMilliseconds -lt 500){return}
+    $script:LastRunUpdate=Get-Date
+    $path=Join-Path $script:Job.OutputDir 'run_state.json'
+    if(-not [IO.File]::Exists($path)){return}
+    try {
+        $state=Read-SharedJson $path
+        $Ui.OpenCurrentReport.IsEnabled=[IO.File]::Exists((Join-Path $script:Job.OutputDir 'timeline.html'))
+        $script:DisplayedStageId=[string]$state.StageId
+        $Ui.SkipSource.IsEnabled=($state.State -eq 'running' -and $state.Source -ne 'Проверка доступа' -and $script:SkipRequestedStage -ne $state.StageId)
+        if($state.State -eq 'running') {
+            $Ui.StateHelp.Text=Get-AuditProgressText $state
+            $Ui.EventCount.Text=[string]$state.Rows
+            if($script:SkipRequestedStage -eq $state.StageId){$Ui.State.Text='Пропускаем текущий источник…'}
+            else {$Ui.State.Text=if($state.WaitingForApi){'Ожидаем ответ Битрикс24'}else{'Собираем доступные события'}}
+        }
+    } catch { } # Retry a concurrent file replacement on the next timer tick.
+}
+function Request-SkipSource {
+    if(-not $script:Job -or $script:Job.Mode -eq 'Users' -or $script:CancelRequested){return}
+    if(Write-SourceSkipRequest $script:Job $script:DisplayedStageId) {
+        $script:SkipRequestedStage=$script:DisplayedStageId;$Ui.SkipSource.IsEnabled=$false
+        $Ui.State.Text='Пропускаем текущий источник…'
+        Add-UiLog 'Пропуск текущего источника: полученные данные сохранятся, отчёт будет отмечен как частичный.'
+    } else {Add-UiLog 'Источник уже сменился. Запрос пропуска не отправлен.';Update-RunProgress}
+}
 function Request-Stop {
     if (-not $script:Process -or $script:CancelRequested) {return}
     [IO.File]::WriteAllText($script:Job.CancelFile,'stop')
-    $script:CancelRequested=$true;$Ui.Stop.IsEnabled=$false
+    $script:CancelRequested=$true;$Ui.Stop.IsEnabled=$false;$Ui.SkipSource.IsEnabled=$false
     if ($script:Job.Mode -eq 'Users') {$Ui.EmployeeHelp.Text='Останавливаем загрузку после текущего запроса…';$Ui.LoadUsers.IsEnabled=$false}
     $Ui.State.Text='Завершаем текущий запрос…'
-    $Ui.StateHelp.Text='Затем сборщик сохранит частичный отчёт. Ожидание сетевого запроса может занять до 90 секунд.'
+    $Ui.StateHelp.Text='Текущий HTTP-запрос прерывается; сборщик сохраняет полученные данные и частичный отчёт.'
     Add-UiLog 'Запрошена остановка. Сохранённые страницы останутся для продолжения.'
 }
 function Finish-Run {
@@ -511,6 +559,8 @@ function Finish-Run {
         $Ui.State.Text='Сбор остановлен';$Ui.StateHelp.Text='Частичный отчёт сохранён. Выберите режим продолжения и эту папку выгрузки.'
     } elseif ($code -ne 0 -or -not $summary) {
         $Ui.State.Text='Не удалось завершить сбор';$Ui.StateHelp.Text='Разверните журнал выполнения ниже. Успешно полученные страницы можно использовать при продолжении.'
+    } elseif ($summary.Partial -and @($summary.SkippedSources).Count -gt 0) {
+        $Ui.State.Text='Частичный отчёт: есть пропущенные источники';$Ui.StateHelp.Text='Пропущены: '+($summary.SkippedSources -join ', ')+'. Полученные данные сохранены. Для недостающих страниц используйте продолжение.'
     } elseif ([int]$summary.Rows -eq 0 -and [int]$summary.Errors -gt 0) {
         $Ui.State.Text='События не получены: ошибки источников';$Ui.StateHelp.Text='Раскройте журнал: в новой версии показан ответ сервера и код API. Проверьте эти сообщения перед повторным сбором.'
     } elseif ([int]$summary.Errors -gt 0) {
@@ -538,7 +588,7 @@ function Finish-Run {
     if ($Ui.OpenFolder.IsEnabled) {
         try {[IO.File]::WriteAllText((Join-Path $script:Job.OutputDir 'gui_run.log'),$Ui.Log.Text,(New-Object Text.UTF8Encoding($true)))} catch {Add-UiLog 'Не удалось сохранить журнал окна.'}
     }
-    if ([IO.File]::Exists($script:Job.CancelFile)) {Remove-Item -LiteralPath $script:Job.CancelFile -Force}
+    foreach($flag in @($script:Job.CancelFile,$script:Job.SkipSourceFile)){if($flag -and [IO.File]::Exists($flag)){Remove-Item -LiteralPath $flag -Force}}
     $script:Job.Webhook='';$Ui.Webhook.Password='';$Ui.VisibleWebhook.Text=''
     Set-Running $false
     if ($script:CloseWhenDone) {$script:Window.Close()}
@@ -594,23 +644,26 @@ $Ui.Start.Add_Click({
         $script:Job=$newJob;$script:Process=$newProcess;$script:SelectedEmployeeLabel=$selection.Label
         $script:Job.Webhook='';$v.Webhook='';$hook=''
         $script:OutTask=$script:Process.StandardOutput.ReadLineAsync();$script:ErrTask=$script:Process.StandardError.ReadLineAsync()
-        $script:CancelRequested=$false;$script:CloseWhenDone=$false;$script:RunStarted=Get-Date;$script:LastStatus=''
+        $script:CancelRequested=$false;$script:CloseWhenDone=$false;$script:RunStarted=Get-Date;$script:LastStatus='';$script:DisplayedStageId='';$script:SkipRequestedStage='';$script:LastRunUpdate=[DateTime]::MinValue
         $Ui.Log.Clear();$Ui.Sources.ItemsSource=$null;$Ui.EventCount.Text='—';$Ui.SourceCount.Text='0';$Ui.ErrorCount.Text='0'
         $Ui.State.Text='Собираем события';$Ui.StateHelp.Text='Папка: '+$script:Job.OutputDir
-        $Ui.OpenReport.IsEnabled=$false;$Ui.OpenFolder.IsEnabled=$false
+        $Ui.OpenReport.IsEnabled=$false;$Ui.OpenCurrentReport.IsEnabled=$false;$Ui.OpenFolder.IsEnabled=$false
         Add-UiLog ('Начало: '+(Get-Date -Format 'dd.MM.yyyy HH:mm:ss'));Add-UiLog ('Результаты: '+$script:Job.OutputDir)
         Set-WizardStep 2;Set-Running $true;$script:Timer.Start()
     } catch {Show-UiError $_.Exception.Message}
 })
+$Ui.SkipSource.Add_Click({try {Request-SkipSource} catch {Show-UiError $_.Exception.Message}})
 $Ui.Stop.Add_Click({try {Request-Stop} catch {Show-UiError $_.Exception.Message}})
-$Ui.OpenReport.Add_Click({try {Start-Process -FilePath (Join-Path $script:Job.OutputDir 'timeline.html')} catch {Show-UiError $_.Exception.Message}})
+$openReport={try {Start-Process -FilePath (Join-Path $script:Job.OutputDir 'timeline.html')} catch {Show-UiError $_.Exception.Message}}
+$Ui.OpenReport.Add_Click($openReport)
+$Ui.OpenCurrentReport.Add_Click($openReport)
 $Ui.OpenFolder.Add_Click({try {Start-Process -FilePath $script:Job.OutputDir} catch {Show-UiError $_.Exception.Message}})
 $Ui.Help.Add_Click({try {Start-Process notepad.exe -ArgumentList ('"'+(Join-Path $script:AppRoot 'README_GUI_RU.txt')+'"')} catch {Show-UiError $_.Exception.Message}})
 $script:Timer.Add_Tick({
     if (-not $script:Process) {return}
     try {
         Read-ProcessLines 'Out';Read-ProcessLines 'Err'
-        if ($script:Job.Mode -ne 'Users') {Update-SourceGrid}
+        if ($script:Job.Mode -ne 'Users') {Update-SourceGrid;Update-RunProgress}
         if ($script:Process.HasExited -and $null -eq $script:OutTask -and $null -eq $script:ErrTask) {if ($script:Job.Mode -eq 'Users') {Finish-Users} else {Finish-Run}}
     } catch {Add-UiLog ('Ошибка интерфейса: '+$_.Exception.Message);try {Request-Stop} catch { }}
 })
@@ -620,8 +673,27 @@ $script:Window.Add_Closing({param($sender,$eventArgs)
 Set-TwoMonths;Update-Mode;Set-WizardStep 1
 if($UiSmokeTest) {
     if($Ui.Employee.Text -or $Ui.Employee.SelectedItem){throw 'Employee must not be preselected'}
+    foreach($step in 1..3){Set-WizardStep $step}
+    if($Ui.ResultView.Visibility -ne 'Visible'){throw 'Wizard navigation failed'}
+    Set-WizardStep 1
     $script:Window.Show();$script:Window.UpdateLayout()
     if($script:Window.ActualWidth -lt 900 -or $script:Window.ActualHeight -lt 600){throw 'Window layout did not initialize'}
+    # Exercise the real WPF timer, child launcher and result page with offline synthetic responses.
+    $smokeDir=Join-Path ([IO.Path]::GetTempPath()) ('audit-wpf-'+[guid]::NewGuid().ToString('N'))
+    $smokeCancel=$smokeDir+'.stop';$smokeSkip=$smokeDir+'.skip'
+    $script:Job=[pscustomobject]@{Parameters=@{SelfTest=$true;OutputDir=$smokeDir;CancelFile=$smokeCancel;SkipSourceFile=$smokeSkip};OutputDir=$smokeDir;CancelFile=$smokeCancel;SkipSourceFile=$smokeSkip;Mode='New';Webhook=''}
+    $script:SelectedEmployeeLabel='Тестовый сотрудник · ID 2052'
+    $script:Process=Start-AuditProcess $script:Job $script:PowerShellExe
+    $script:OutTask=$script:Process.StandardOutput.ReadLineAsync();$script:ErrTask=$script:Process.StandardError.ReadLineAsync()
+    Set-WizardStep 2;Set-Running $true;$script:Timer.Start()
+    $deadline=[Diagnostics.Stopwatch]::StartNew()
+    while($script:Process -and $deadline.Elapsed.TotalSeconds -lt 60) {
+        $script:Window.Dispatcher.Invoke([Action]{},[Windows.Threading.DispatcherPriority]::Background)
+        [Threading.Thread]::Sleep(20)
+    }
+    if($script:Process){$script:Process.Kill();throw ('WPF process did not finish: '+$Ui.Log.Text)}
+    if($Ui.ResultView.Visibility -ne 'Visible' -or $Ui.ResultRows.Text -ne '65' -or $Ui.ResultErrors.Text -ne '0' -or $Ui.ResultTitle.Text -ne 'Отчёт готов'){throw ('WPF result screen failed: '+$Ui.ResultHelp.Text+' '+$Ui.ResultLog.Text)}
+    $script:Window.UpdateLayout()
     if($SmokeOutput) {
         $bitmap=New-Object Windows.Media.Imaging.RenderTargetBitmap ([int]$script:Window.ActualWidth),([int]$script:Window.ActualHeight),96,96,([Windows.Media.PixelFormats]::Pbgra32)
         $bitmap.Render($script:Window)
@@ -629,7 +701,7 @@ if($UiSmokeTest) {
         $encoder.Frames.Add([Windows.Media.Imaging.BitmapFrame]::Create($bitmap))
         $stream=[IO.File]::Create($SmokeOutput);try{$encoder.Save($stream)}finally{$stream.Dispose()}
     }
-    $script:Window.Close();Write-Host 'WPF SMOKE TEST PASSED: real window, layout, empty employee choice.'
+    $script:Window.Close();Write-Host 'WPF SMOKE TEST PASSED: real window, empty employee choice, three-step navigation, live dispatcher, actual collector process and final report screen with 65 events.'
 } else {[void]$script:Window.ShowDialog()}
 $script:Timer.Stop()
 } catch {

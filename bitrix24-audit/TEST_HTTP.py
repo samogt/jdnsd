@@ -6,15 +6,23 @@ from pathlib import Path
 import subprocess
 import tempfile
 import threading
+import time
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
+    slow_requests = []
+    seen_requests = []
     def log_message(self, *args):
         pass
 
     def do_POST(self):
         self.rfile.read(int(self.headers.get('Content-Length', '0')))
         name = self.path.rsplit('/', 1)[-1]
+        self.seen_requests.append(name)
+        if name.startswith('test.slow'):
+            self.slow_requests.append(name)
+            time.sleep(15)
+            return
         responses = {
             'test.bad': (400, {'error': {'code': 'INVALID_FILTER', 'message': 'Invalid timestamp'}}),
             'test.auth': (401, {'error': 'insufficient_scope', 'error_description': 'Task scope missing'}),
@@ -49,6 +57,32 @@ $bad=Get-ChildItem (Join-Path $OutputDir 'raw/failed-test.bad*')|Select-Object -
 $content=Read-Json ([IO.File]::ReadAllText($bad.FullName))
 if($content.Response -notmatch 'Invalid timestamp'){throw 'Raw HTTP response missing'}
 if([DateTimeOffset]$script:RateBlocked['test.rate'] -lt [DateTimeOffset]::UtcNow.AddSeconds(590)){throw 'Retry-After not preserved'}
+
+$PauseMilliseconds=0
+# Interrupt two real in-flight HTTP requests through the same collector callback as the GUI.
+$originalAssert=(Get-Command Assert-Collecting).ScriptBlock
+$CancelFile=Join-Path $OutputDir 'http-stop.flag';$SkipSourceFile=Join-Path $OutputDir 'http-skip.flag'
+$script:ControlClock=$null;$script:ControlKind=''
+function Assert-Collecting {
+ if($script:ControlClock -and $script:ControlClock.ElapsedMilliseconds -ge 500) {
+  if($script:ControlKind -eq 'cancel'){[IO.File]::WriteAllText($CancelFile,'stop')}
+  else{[IO.File]::WriteAllText($SkipSourceFile,$script:SourceRunId)}
+ }
+ & $originalAssert
+}
+foreach($kind in @('cancel','skip')) {
+ $script:ControlKind=$kind;$script:SourceRunId=[guid]::NewGuid().ToString('N')
+ $before=$script:NetworkCalls;$script:ControlClock=[Diagnostics.Stopwatch]::StartNew();$caught=''
+ try{$null=Invoke-Api "test.slow.$kind" @{}}catch{$caught=$_.Exception.Message}
+ $script:ControlClock.Stop()
+ $expected=if($kind -eq 'cancel'){'AUDIT_CANCELLED'}else{'AUDIT_SOURCE_SKIPPED'}
+ if($caught -notmatch $expected -or $script:ControlClock.Elapsed.TotalSeconds -ge 5 -or $script:NetworkCalls -ne ($before+1)){throw "In-flight $kind failed: $caught; elapsed=$($script:ControlClock.Elapsed.TotalSeconds)"}
+ $script:ControlClock=$null
+ foreach($flag in @($CancelFile,$SkipSourceFile)){if([IO.File]::Exists($flag)){[IO.File]::Delete($flag)}}
+}
+Set-Item Function:Assert-Collecting $originalAssert
+$CancelFile='';$SkipSourceFile=''
+Write-Host 'IN-FLIGHT HTTP TEST PASSED: whole-run cancel and source skip interrupt waiting requests in under 5 seconds, without retries.'
 $script:Disabled=@{};$script:EventUserOnlyDone=$false;$script:ProbeFilters=New-Object 'Collections.Generic.List[object]'
 function Get-Pages {param($Method,$Payload,$Items,$Mode,$Size)
  $script:ProbeFilters.Add($Payload.filter)
@@ -68,4 +102,6 @@ try:
         result = subprocess.run([options.powershell, '-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', str(path)], timeout=120)
 finally:
     server.shutdown()
+if result.returncode == 0 and len(Handler.slow_requests) != 2:
+    raise SystemExit('Cancellation test did not reach both real HTTP requests: '+repr(Handler.slow_requests)+'; all='+repr(Handler.seen_requests))
 raise SystemExit(result.returncode)
